@@ -5,7 +5,9 @@
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+// Use a same-origin proxy to avoid browser CORS issues in production.
+// The proxy routes forward requests to the actual backend.
+const BACKEND_URL = '/api/backend';
 
 async function extractFastApiErrorMessage(data: unknown): Promise<string | undefined> {
   if (!data) return undefined;
@@ -166,7 +168,7 @@ export async function getCodeFile(filename: string): Promise<{
   error?: string;
 }> {
   try {
-    const response = await axios.get(`${BACKEND_URL}/get_code/${filename}`);
+    const response = await axios.get(`${BACKEND_URL}/get_code/${encodeURIComponent(filename)}`);
     return {
       success: true,
       code: response.data.code,
@@ -233,8 +235,8 @@ export async function renderManim(
 
 export async function checkBackendHealth(): Promise<boolean> {
   try {
-    const response = await axios.get(BACKEND_URL, { timeout: 5000 });
-    return response.data?.status === 'running';
+    const response = await axios.get(`${BACKEND_URL}/health`, { timeout: 5000 });
+    return response.data?.ok === true;
   } catch {
     return false;
   }
