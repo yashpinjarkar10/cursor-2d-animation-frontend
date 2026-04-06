@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Type, Plus, Trash2, ChevronDown, ChevronUp } from 'lucide-react';
 import type { Clip, TextOverlay } from '@/lib/api';
 
@@ -8,6 +8,13 @@ interface PropertiesPanelProps {
     selectedClip: Clip | null;
     onUpdateClip: (clip: Clip) => void;
     onAddText: (textData: Partial<TextOverlay>) => void;
+    onAddTtsAudio: (data: {
+        text: string;
+        voice?: string;
+        rate?: number;
+        pitch?: number;
+        volume?: number;
+    }) => void;
     currentTime: number;
     selectedTextOverlay: TextOverlay | null;
     onUpdateText: (text: TextOverlay) => void;
@@ -20,6 +27,7 @@ export default function PropertiesPanel({
     selectedClip,
     onUpdateClip,
     onAddText,
+    onAddTtsAudio,
     currentTime,
     selectedTextOverlay,
     onUpdateText,
@@ -29,7 +37,46 @@ export default function PropertiesPanel({
 }: PropertiesPanelProps) {
     const [showClipProps, setShowClipProps] = useState(true);
     const [showTextOverlays, setShowTextOverlays] = useState(true);
+    const [showTts, setShowTts] = useState(true);
     const [newText, setNewText] = useState('');
+    const [ttsText, setTtsText] = useState('');
+    const [ttsSupported, setTtsSupported] = useState(true);
+    const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+    const [ttsVoice, setTtsVoice] = useState<string>('');
+    const [ttsRate, setTtsRate] = useState<number>(1);
+    const [ttsPitch, setTtsPitch] = useState<number>(1);
+    const [ttsVolume, setTtsVolume] = useState<number>(1);
+
+    const selectedIsSpeechClip = useMemo(() => {
+        return Boolean(selectedClip && selectedClip.type === 'audio' && selectedClip.ttsText && selectedClip.ttsText.trim());
+    }, [selectedClip]);
+
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+
+        const supported =
+            typeof window.speechSynthesis !== 'undefined' &&
+            typeof window.SpeechSynthesisUtterance !== 'undefined';
+        setTtsSupported(supported);
+        if (!supported) return;
+
+        const load = () => {
+            try {
+                const list = window.speechSynthesis.getVoices();
+                setVoices(list);
+                if (!ttsVoice && list.length > 0) {
+                    setTtsVoice(list[0].name);
+                }
+            } catch {
+                // ignore
+            }
+        };
+
+        load();
+        window.speechSynthesis.addEventListener('voiceschanged', load);
+        return () => window.speechSynthesis.removeEventListener('voiceschanged', load);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     const handleAddText = () => {
         if (!newText.trim()) return;
@@ -43,6 +90,41 @@ export default function PropertiesPanel({
             color: '#ffffff',
         });
         setNewText('');
+    };
+
+    const handleAddTts = () => {
+        const text = ttsText.trim();
+        if (!text) return;
+        onAddTtsAudio({
+            text,
+            voice: ttsVoice || undefined,
+            rate: ttsRate,
+            pitch: ttsPitch,
+            volume: ttsVolume,
+        });
+        setTtsText('');
+    };
+
+    const handlePreviewTts = () => {
+        if (typeof window === 'undefined') return;
+        if (!ttsSupported) return;
+        const text = ttsText.trim();
+        if (!text) return;
+
+        try {
+            window.speechSynthesis.cancel();
+            const u = new SpeechSynthesisUtterance(text);
+            u.rate = ttsRate;
+            u.pitch = ttsPitch;
+            u.volume = ttsVolume;
+            if (ttsVoice) {
+                const v = voices.find(vv => vv.name === ttsVoice);
+                if (v) u.voice = v;
+            }
+            window.speechSynthesis.speak(u);
+        } catch {
+            // ignore
+        }
     };
 
     return (
@@ -256,6 +338,222 @@ export default function PropertiesPanel({
                         </div>
                     )}
                 </div>
+
+                {/* Text to Speech */}
+                <div className="border-t border-dark-700">
+                    <button
+                        onClick={() => setShowTts(!showTts)}
+                        className="w-full flex items-center justify-between px-3 py-2 hover:bg-dark-700/30 transition-colors"
+                    >
+                        <span className="text-xs font-medium text-white/70">Text to Speech</span>
+                        {showTts ? <ChevronUp className="w-3 h-3 text-white/30" /> : <ChevronDown className="w-3 h-3 text-white/30" />}
+                    </button>
+
+                    {showTts && (
+                        <div className="px-3 pb-3 space-y-2">
+                            {!ttsSupported && (
+                                <p className="text-[10px] text-white/30">
+                                    Text-to-speech is not supported in this browser.
+                                </p>
+                            )}
+                            <textarea
+                                className="input !text-xs min-h-[70px] resize-none"
+                                placeholder="Type text to speak (free, browser TTS)..."
+                                value={ttsText}
+                                onChange={e => setTtsText(e.target.value)}
+                            />
+
+                            <div>
+                                <label className="text-[10px] text-white/40 uppercase tracking-wider">Voice</label>
+                                <select
+                                    className="input !text-xs mt-1"
+                                    value={ttsVoice}
+                                    onChange={e => setTtsVoice(e.target.value)}
+                                    disabled={!ttsSupported || voices.length === 0}
+                                >
+                                    {voices.length === 0 ? (
+                                        <option value="">Loading voices…</option>
+                                    ) : (
+                                        voices.map(v => (
+                                            <option key={`${v.name}-${v.lang}`} value={v.name}>
+                                                {v.name} ({v.lang})
+                                            </option>
+                                        ))
+                                    )}
+                                </select>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-2">
+                                <div>
+                                    <label className="text-[10px] text-white/40 uppercase tracking-wider">Rate</label>
+                                    <input
+                                        type="range"
+                                        min="0.5"
+                                        max="2"
+                                        step="0.1"
+                                        className="w-full mt-2"
+                                        value={ttsRate}
+                                        onChange={e => setTtsRate(parseFloat(e.target.value))}
+                                        disabled={!ttsSupported}
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-[10px] text-white/40 uppercase tracking-wider">Pitch</label>
+                                    <input
+                                        type="range"
+                                        min="0"
+                                        max="2"
+                                        step="0.1"
+                                        className="w-full mt-2"
+                                        value={ttsPitch}
+                                        onChange={e => setTtsPitch(parseFloat(e.target.value))}
+                                        disabled={!ttsSupported}
+                                    />
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="text-[10px] text-white/40 uppercase tracking-wider">Volume</label>
+                                <input
+                                    type="range"
+                                    min="0"
+                                    max="1"
+                                    step="0.05"
+                                    className="w-full mt-2"
+                                    value={ttsVolume}
+                                    onChange={e => setTtsVolume(parseFloat(e.target.value))}
+                                    disabled={!ttsSupported}
+                                />
+                            </div>
+
+                            <div className="flex gap-2">
+                                <button
+                                    className="btn btn-secondary flex-1"
+                                    onClick={handlePreviewTts}
+                                    disabled={!ttsSupported || !ttsText.trim()}
+                                    title="Preview speech"
+                                >
+                                    Preview
+                                </button>
+                                <button
+                                    className="btn btn-primary flex-1"
+                                    onClick={handleAddTts}
+                                    disabled={!ttsSupported || !ttsText.trim()}
+                                    title="Add speech clip to timeline"
+                                >
+                                    Add
+                                </button>
+                            </div>
+                            <p className="text-[10px] text-white/30">
+                                Adds a speech clip at the current playhead time (preview playback only).
+                            </p>
+                        </div>
+                    )}
+                </div>
+
+                {/* Speech Clip Editor */}
+                {selectedIsSpeechClip && selectedClip && (
+                    <div className="border-t border-dark-700">
+                        <div className="px-3 py-2 text-xs font-medium text-white/70">Speech Clip</div>
+                        <div className="px-3 pb-3 space-y-2">
+                            <textarea
+                                className="input !text-xs min-h-[70px] resize-none"
+                                value={selectedClip.ttsText || ''}
+                                onChange={e => onUpdateClip({ ...selectedClip, ttsText: e.target.value })}
+                            />
+
+                            <div>
+                                <label className="text-[10px] text-white/40 uppercase tracking-wider">Voice</label>
+                                <select
+                                    className="input !text-xs mt-1"
+                                    value={selectedClip.ttsVoice || ''}
+                                    onChange={e => onUpdateClip({ ...selectedClip, ttsVoice: e.target.value })}
+                                    disabled={!ttsSupported || voices.length === 0}
+                                >
+                                    {voices.length === 0 ? (
+                                        <option value="">Loading voices…</option>
+                                    ) : (
+                                        voices.map(v => (
+                                            <option key={`${v.name}-${v.lang}`} value={v.name}>
+                                                {v.name} ({v.lang})
+                                            </option>
+                                        ))
+                                    )}
+                                </select>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-2">
+                                <div>
+                                    <label className="text-[10px] text-white/40 uppercase tracking-wider">Rate</label>
+                                    <input
+                                        type="range"
+                                        min="0.5"
+                                        max="2"
+                                        step="0.1"
+                                        className="w-full mt-2"
+                                        value={selectedClip.ttsRate ?? 1}
+                                        onChange={e => onUpdateClip({ ...selectedClip, ttsRate: parseFloat(e.target.value) })}
+                                        disabled={!ttsSupported}
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-[10px] text-white/40 uppercase tracking-wider">Pitch</label>
+                                    <input
+                                        type="range"
+                                        min="0"
+                                        max="2"
+                                        step="0.1"
+                                        className="w-full mt-2"
+                                        value={selectedClip.ttsPitch ?? 1}
+                                        onChange={e => onUpdateClip({ ...selectedClip, ttsPitch: parseFloat(e.target.value) })}
+                                        disabled={!ttsSupported}
+                                    />
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="text-[10px] text-white/40 uppercase tracking-wider">Volume</label>
+                                <input
+                                    type="range"
+                                    min="0"
+                                    max="1"
+                                    step="0.05"
+                                    className="w-full mt-2"
+                                    value={selectedClip.ttsVolume ?? 1}
+                                    onChange={e => onUpdateClip({ ...selectedClip, ttsVolume: parseFloat(e.target.value) })}
+                                    disabled={!ttsSupported}
+                                />
+                            </div>
+
+                            <button
+                                className="btn btn-secondary w-full"
+                                onClick={() => {
+                                    if (typeof window === 'undefined') return;
+                                    if (!ttsSupported) return;
+                                    const text = (selectedClip.ttsText || '').trim();
+                                    if (!text) return;
+                                    try {
+                                        window.speechSynthesis.cancel();
+                                        const u = new SpeechSynthesisUtterance(text);
+                                        u.rate = selectedClip.ttsRate ?? 1;
+                                        u.pitch = selectedClip.ttsPitch ?? 1;
+                                        u.volume = selectedClip.ttsVolume ?? 1;
+                                        if (selectedClip.ttsVoice) {
+                                            const v = voices.find(vv => vv.name === selectedClip.ttsVoice);
+                                            if (v) u.voice = v;
+                                        }
+                                        window.speechSynthesis.speak(u);
+                                    } catch {
+                                        // ignore
+                                    }
+                                }}
+                                disabled={!ttsSupported || !(selectedClip.ttsText || '').trim()}
+                            >
+                                Preview Clip
+                            </button>
+                        </div>
+                    </div>
+                )}
             </div>
         </div>
     );

@@ -42,6 +42,12 @@ export interface Clip {
   videoUrl?: string;
   videoPath?: string;
   audioPath?: string;
+  // Web Speech API (free) text-to-speech support for audio clips.
+  ttsText?: string;
+  ttsVoice?: string;
+  ttsRate?: number;
+  ttsPitch?: number;
+  ttsVolume?: number;
   code?: string;
   codeFilename?: string;
   name: string;

@@ -37,6 +37,12 @@ export default function EditorPage() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [seekToTime, setSeekToTime] = useState<number | null>(null);
 
+  const audioPlayersRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+
+  const speechStateRef = useRef<{ clipId: string | null }>(
+    { clipId: null }
+  );
+
   // Generation tracking
   const [generatingTasks, setGeneratingTasks] = useState<GeneratingTask[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -105,6 +111,57 @@ export default function EditorPage() {
     audioClipsRef.current = audioClips;
   }, [audioClips]);
 
+  const estimateTtsDurationSeconds = useCallback((text: string, rate?: number): number => {
+    const words = text.trim().split(/\s+/).filter(Boolean).length;
+    // Rough baseline: 170 WPM at rate=1.
+    const wpm = 170 * (typeof rate === 'number' && rate > 0 ? rate : 1);
+    const seconds = words > 0 ? (words / wpm) * 60 : 1;
+    return Math.max(1, Math.min(120, Number.isFinite(seconds) ? seconds : 3));
+  }, []);
+
+  const stopSpeech = useCallback(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.speechSynthesis.cancel();
+    } catch {
+      // ignore
+    }
+    speechStateRef.current.clipId = null;
+  }, []);
+
+  const speakClip = useCallback((clip: Clip) => {
+    if (typeof window === 'undefined') return;
+    if (!clip.ttsText) return;
+
+    const id = clip.timelineId || clip.id;
+    stopSpeech();
+
+    const utterance = new SpeechSynthesisUtterance(clip.ttsText);
+    if (typeof clip.ttsRate === 'number') utterance.rate = clip.ttsRate;
+    if (typeof clip.ttsPitch === 'number') utterance.pitch = clip.ttsPitch;
+    if (typeof clip.ttsVolume === 'number') utterance.volume = clip.ttsVolume;
+
+    // Note: voice selection is optional and browser-dependent.
+    if (clip.ttsVoice) {
+      const voices = window.speechSynthesis.getVoices();
+      const match = voices.find(v => v.name === clip.ttsVoice);
+      if (match) utterance.voice = match;
+    }
+
+    utterance.onend = () => {
+      if (speechStateRef.current.clipId === id) {
+        speechStateRef.current.clipId = null;
+      }
+    };
+
+    speechStateRef.current.clipId = id;
+    try {
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      speechStateRef.current.clipId = null;
+    }
+  }, [stopSpeech]);
+
   const revokeBlobUrl = useCallback((url?: string) => {
     if (!url || !url.startsWith('blob:')) return;
     try {
@@ -137,6 +194,157 @@ export default function EditorPage() {
       if (!stillUsed) revokeBlobUrl(audioUrl);
     }
   }, [revokeBlobUrl]);
+
+  // Keep audio elements in sync with audioClips list (create/remove).
+  useEffect(() => {
+    const players = audioPlayersRef.current;
+    const keep = new Set<string>();
+
+    for (const clip of audioClips) {
+      const id = clip.timelineId || clip.id;
+      if (!clip.audioPath) continue;
+      keep.add(id);
+
+      const existing = players.get(id);
+      if (existing) {
+        if (existing.src !== clip.audioPath) existing.src = clip.audioPath;
+        continue;
+      }
+
+      const audio = new Audio(clip.audioPath);
+      audio.preload = 'auto';
+      players.set(id, audio);
+
+      const onLoaded = () => {
+        const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
+        if (!dur) return;
+        setAudioClips(prev =>
+          prev.map(c => {
+            const cid = c.timelineId || c.id;
+            if (cid !== id) return c;
+            // Only fill in if missing.
+            const nextDuration = c.duration || dur;
+            const nextTrimEnd = c.trimEnd || dur;
+            return { ...c, duration: nextDuration, trimEnd: nextTrimEnd };
+          })
+        );
+      };
+
+      audio.addEventListener('loadedmetadata', onLoaded);
+
+      // Cleanup listener if this audio element ever gets removed.
+      (audio as unknown as { __onLoaded?: () => void }).__onLoaded = onLoaded;
+    }
+
+    for (const [id, audio] of players.entries()) {
+      if (keep.has(id)) continue;
+      try {
+        audio.pause();
+      } catch {
+        // ignore
+      }
+      const onLoaded = (audio as unknown as { __onLoaded?: () => void }).__onLoaded;
+      if (onLoaded) audio.removeEventListener('loadedmetadata', onLoaded);
+      players.delete(id);
+    }
+  }, [audioClips]);
+
+  const syncAudioToTime = useCallback((globalTime: number, playing: boolean) => {
+    const players = audioPlayersRef.current;
+
+    for (const clip of audioClipsRef.current) {
+      const id = clip.timelineId || clip.id;
+      const audio = players.get(id);
+      if (!audio) continue;
+
+      const start = clip.startTime || 0;
+      const clipDur = (clip.trimEnd || clip.duration || 0) - (clip.trimStart || 0);
+      const end = start + Math.max(0, clipDur);
+
+      // If duration unknown, treat as potentially active after start.
+      const isActive = clipDur > 0 ? globalTime >= start && globalTime <= end : globalTime >= start;
+
+      if (!isActive) {
+        try {
+          if (!audio.paused) audio.pause();
+          if (audio.currentTime !== 0) audio.currentTime = 0;
+        } catch {
+          // ignore
+        }
+        continue;
+      }
+
+      const target = Math.max(0, (clip.trimStart || 0) + (globalTime - start));
+
+      // Avoid constant seeking; only correct if drift is meaningful.
+      try {
+        if (Math.abs(audio.currentTime - target) > 0.25) {
+          audio.currentTime = target;
+        }
+        if (playing) {
+          if (audio.paused) {
+            void audio.play().catch(() => {});
+          }
+        } else {
+          if (!audio.paused) audio.pause();
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // Web Speech API TTS playback (free, browser-only)
+    if (typeof window === 'undefined') return;
+
+    // Keep pause/resume behavior consistent.
+    try {
+      if (!playing) {
+        if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
+          window.speechSynthesis.pause();
+        }
+      } else {
+        if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+      }
+    } catch {
+      // ignore
+    }
+
+    const ttsClips = audioClipsRef.current
+      .filter(c => typeof c.ttsText === 'string' && c.ttsText.trim())
+      .sort((a, b) => (a.startTime || 0) - (b.startTime || 0));
+
+    const active = ttsClips.find(c => {
+      const start = c.startTime || 0;
+      const dur = (c.trimEnd || c.duration || 0) - (c.trimStart || 0);
+      const end = start + Math.max(0, dur);
+      return globalTime >= start && (dur > 0 ? globalTime <= end : true);
+    });
+
+    const activeId = active ? (active.timelineId || active.id) : null;
+
+    // If we left the active clip window, stop speaking.
+    if (!activeId) {
+      if (speechStateRef.current.clipId) stopSpeech();
+      return;
+    }
+
+    // If we are inside a TTS clip and playing, ensure it's started.
+    if (playing) {
+      if (speechStateRef.current.clipId !== activeId) {
+        speakClip(active as Clip);
+      } else {
+        // If synthesis got cancelled externally, restart once.
+        if (!window.speechSynthesis.speaking && !window.speechSynthesis.pending) {
+          speakClip(active as Clip);
+        }
+      }
+    }
+  }, []);
+
+  // Sync audio on seek/time updates and play/pause.
+  useEffect(() => {
+    syncAudioToTime(currentTime, isPlaying);
+  }, [currentTime, isPlaying, syncAudioToTime]);
 
   useEffect(() => {
     return () => {
@@ -344,7 +552,12 @@ export default function EditorPage() {
     const remainingClips = clips.filter(c => c.id !== clipId);
     setClips(remainingClips);
 
-    maybeRevokeClipBlobUrls(removedClip, remainingClips, audioClips);
+    const remainingAudio = audioClips.filter(a => a.id !== clipId && a.timelineId !== clipId);
+    if (remainingAudio.length !== audioClips.length) {
+      setAudioClips(remainingAudio);
+    }
+
+    maybeRevokeClipBlobUrls(removedClip, remainingClips, remainingAudio);
 
     if (selectedClip?.id === clipId) {
       setSelectedClip(null);
@@ -353,6 +566,73 @@ export default function EditorPage() {
     }
     if (removedClip) showToast(`Removed: ${removedClip.name}`, 'info');
   }, [audioClips, clips, maybeRevokeClipBlobUrls, selectedClip, showToast]);
+
+  const handleRemoveAudioFromTimeline = useCallback((audioId: string) => {
+    setAudioClips(prev => {
+      const removed = prev.find(a => (a.timelineId || a.id) === audioId);
+      const remaining = prev.filter(a => (a.timelineId || a.id) !== audioId);
+      maybeRevokeClipBlobUrls(removed, clipsRef.current, remaining);
+      return remaining;
+    });
+    if (speechStateRef.current.clipId === audioId) stopSpeech();
+    showToast('Audio removed from timeline', 'info');
+  }, [maybeRevokeClipBlobUrls, showToast, stopSpeech]);
+
+  const handleMoveAudioOnTimeline = useCallback((audioId: string, startTime: number) => {
+    setAudioClips(prev =>
+      prev.map(a => ((a.timelineId || a.id) === audioId ? { ...a, startTime } : a))
+    );
+    setClips(prev =>
+      prev.map(c =>
+        c.type === 'audio' && (c.timelineId || c.id) === audioId
+          ? { ...c, startTime }
+          : c
+      )
+    );
+  }, []);
+
+  const handleAddTtsAudio = useCallback(async (data: {
+    text: string;
+    voice?: string;
+    rate?: number;
+    pitch?: number;
+    volume?: number;
+  }) => {
+    const startTime = currentTime;
+    const text = data.text;
+    const id = uuidv4();
+    const clipName = `TTS: ${text.substring(0, 32)}${text.length > 32 ? '…' : ''}`;
+    const duration = estimateTtsDurationSeconds(text, data.rate);
+
+    const newAudio: Clip = {
+      id,
+      timelineId: id,
+      type: 'audio',
+      source: 'local',
+      ttsText: text,
+      ttsVoice: data.voice,
+      ttsRate: data.rate,
+      ttsPitch: data.pitch,
+      ttsVolume: data.volume,
+      name: clipName,
+      duration,
+      trimStart: 0,
+      trimEnd: duration,
+      startTime,
+    };
+
+    setClips(prev => [...prev, newAudio]);
+    setAudioClips(prev => [...prev, newAudio]);
+    setSelectedClip(newAudio);
+    showToast('Speech added to timeline', 'success');
+  }, [currentTime, estimateTtsDurationSeconds, showToast]);
+
+  const handleUpdateClip = useCallback((clip: Clip) => {
+    setClips(prev => prev.map(c => (c.id === clip.id ? clip : c)));
+    if (clip.type === 'audio') {
+      setAudioClips(prev => prev.map(a => ((a.timelineId || a.id) === clip.id ? { ...a, ...clip } : a)));
+    }
+  }, []);
 
   const handleSelectClip = useCallback((clip: Clip | null) => {
     if (clip) {
@@ -713,8 +993,9 @@ export default function EditorPage() {
         {showRightPanel && (
           <PropertiesPanel
             selectedClip={selectedClip}
-            onUpdateClip={(clip: Clip) => setClips(prev => prev.map(c => (c.id === clip.id ? clip : c)))}
+            onUpdateClip={handleUpdateClip}
             onAddText={handleAddText}
+            onAddTtsAudio={handleAddTtsAudio}
             currentTime={currentTime}
             selectedTextOverlay={selectedTextOverlay}
             onUpdateText={(text: TextOverlay) => setTextOverlays(prev => prev.map(t => (t.id === text.id ? text : t)))}
@@ -736,10 +1017,8 @@ export default function EditorPage() {
         textOverlays={textOverlays}
         onTrimClip={handleTrimClip}
         onSplitClip={handleSplitClip}
-        onRemoveAudio={(audioId: string) => {
-          setAudioClips(prev => prev.filter(a => a.timelineId !== audioId));
-          showToast('Audio removed from timeline', 'info');
-        }}
+        onRemoveAudio={handleRemoveAudioFromTimeline}
+        onMoveAudio={handleMoveAudioOnTimeline}
         onRemoveText={handleRemoveText}
         onSelectText={handleSelectText}
         currentTime={currentTime}

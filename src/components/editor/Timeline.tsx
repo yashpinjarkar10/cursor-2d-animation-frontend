@@ -15,6 +15,7 @@ interface TimelineProps {
   onTrimClip: (clipId: string, trimStart: number, trimEnd: number) => void;
   onSplitClip: (clipId: string, splitTime: number) => void;
   onRemoveAudio?: (audioId: string) => void;
+  onMoveAudio?: (audioId: string, startTime: number) => void;
   onRemoveText?: (textId: string) => void;
   onSelectText?: (textId: string) => void;
   currentTime: number;
@@ -36,6 +37,7 @@ export default function Timeline({
   onTrimClip,
   onSplitClip,
   onRemoveAudio,
+  onMoveAudio,
   onRemoveText,
   onSelectText,
   currentTime,
@@ -43,20 +45,77 @@ export default function Timeline({
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [isCollapsed, setIsCollapsed] = useState(false);
-  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; clipId: string } | null>(null);
   const [pixelsPerSecond, setPixelsPerSecond] = useState(80);
 
+  const draggingAudioRef = useRef<{
+    id: string;
+    startClientX: number;
+    initialStartTime: number;
+  } | null>(null);
+  const [draggingAudioId, setDraggingAudioId] = useState<string | null>(null);
+
+  const draggingVideoRef = useRef<{
+    clipId: string;
+    sourceIndex: number;
+    insertionIndex: number;
+    videoClipIds: string[];
+    durations: number[];
+  } | null>(null);
+  const [draggingVideoId, setDraggingVideoId] = useState<string | null>(null);
+  const [videoInsertionIndex, setVideoInsertionIndex] = useState<number | null>(null);
+
   const videoClips = useMemo(() => clips.filter(c => c.type === 'video'), [clips]);
 
+  const audioLanes = useMemo(() => {
+    if (!audioClips.length) return [] as Clip[][];
+
+    const sorted = [...audioClips].sort((a, b) => (a.startTime || 0) - (b.startTime || 0));
+    const lanes: { end: number; clips: Clip[] }[] = [];
+
+    for (const clip of sorted) {
+      const start = clip.startTime || 0;
+      const dur = (clip.trimEnd || clip.duration || 10) - (clip.trimStart || 0);
+      const safeDur = Math.max(0.1, dur || 0);
+      const end = start + safeDur;
+
+      let placed = false;
+      for (const lane of lanes) {
+        if (lane.end <= start) {
+          lane.clips.push(clip);
+          lane.end = end;
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) lanes.push({ end, clips: [clip] });
+    }
+
+    return lanes.map(l => l.clips);
+  }, [audioClips]);
+
   // Total timeline duration
-  const totalDuration = useMemo(() =>
-    videoClips.reduce((sum, clip) => {
+  const totalDuration = useMemo(() => {
+    const videoTotal = videoClips.reduce((sum, clip) => {
       const clipDuration = (clip.trimEnd || clip.duration || 0) - (clip.trimStart || 0);
-      return sum + clipDuration;
-    }, 0),
-    [videoClips]
-  );
+      return sum + Math.max(0, clipDuration);
+    }, 0);
+
+    const audioEnd = audioClips.reduce((max, clip) => {
+      const start = clip.startTime || 0;
+      const dur = (clip.trimEnd || clip.duration || 0) - (clip.trimStart || 0);
+      const end = start + Math.max(0, dur);
+      return Math.max(max, end);
+    }, 0);
+
+    const textEnd = textOverlays.reduce((max, t) => {
+      const start = t.startTime || 0;
+      const end = start + Math.max(0, t.duration || 0);
+      return Math.max(max, end);
+    }, 0);
+
+    return Math.max(videoTotal, audioEnd, textEnd);
+  }, [videoClips, audioClips, textOverlays]);
 
   const timelineWidth = Math.max(totalDuration * pixelsPerSecond, 600);
 
@@ -65,10 +124,116 @@ export default function Timeline({
     if (!scrollRef.current) return;
     const rect = scrollRef.current.getBoundingClientRect();
     const scrollLeft = scrollRef.current.scrollLeft;
-    const x = e.clientX - rect.left + scrollLeft;
+    const x = e.clientX - rect.left + scrollLeft - LABEL_WIDTH;
     const time = x / pixelsPerSecond;
     onSeek(Math.max(0, Math.min(time, totalDuration)));
   }, [onSeek, totalDuration, pixelsPerSecond]);
+
+  // Video dragging (ripple reorder)
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!draggingVideoRef.current) return;
+      if (!scrollRef.current) return;
+
+      const rect = scrollRef.current.getBoundingClientRect();
+      const scrollLeft = scrollRef.current.scrollLeft;
+      const x = e.clientX - rect.left + scrollLeft - LABEL_WIDTH;
+      const time = x / pixelsPerSecond;
+
+      const { durations } = draggingVideoRef.current;
+      const n = durations.length;
+      if (n === 0) return;
+
+      const t = Math.max(0, time);
+      let accumulated = 0;
+      let insertionIndex = n;
+      for (let i = 0; i < n; i++) {
+        const dur = Math.max(0.001, durations[i]);
+        const mid = accumulated + dur / 2;
+        if (t < mid) {
+          insertionIndex = i;
+          break;
+        }
+        accumulated += dur;
+      }
+
+      draggingVideoRef.current.insertionIndex = insertionIndex;
+      setVideoInsertionIndex(insertionIndex);
+    };
+
+    const onUp = () => {
+      if (!draggingVideoRef.current) return;
+
+      const { clipId, sourceIndex, insertionIndex, videoClipIds } = draggingVideoRef.current;
+      draggingVideoRef.current = null;
+      setDraggingVideoId(null);
+      setVideoInsertionIndex(null);
+
+      const n = videoClipIds.length;
+      if (n <= 1) return;
+      if (insertionIndex === sourceIndex || insertionIndex === sourceIndex + 1) return;
+
+      const sourceId = clipId;
+      const nextOrder = [...videoClipIds];
+      const from = nextOrder.indexOf(sourceId);
+      if (from === -1) return;
+      nextOrder.splice(from, 1);
+
+      const insertAt = insertionIndex > sourceIndex ? insertionIndex - 1 : insertionIndex;
+      const clamped = Math.max(0, Math.min(insertAt, nextOrder.length));
+      nextOrder.splice(clamped, 0, sourceId);
+
+      const byId = new Map(videoClips.map(v => [v.id, v] as const));
+      const reorderedVideos = nextOrder.map(id => byId.get(id)).filter(Boolean) as Clip[];
+      if (reorderedVideos.length !== videoClips.length) return;
+
+      const nextClips = [...clips];
+      const videoIndexes: number[] = [];
+      for (let i = 0; i < nextClips.length; i++) {
+        if (nextClips[i].type === 'video') videoIndexes.push(i);
+      }
+      for (let i = 0; i < videoIndexes.length; i++) {
+        nextClips[videoIndexes[i]] = reorderedVideos[i];
+      }
+      onReorderClips(nextClips);
+    };
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [clips, onReorderClips, pixelsPerSecond, videoClips]);
+
+  // Audio dragging
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!draggingAudioRef.current) return;
+      if (!onMoveAudio) return;
+      const { id, startClientX, initialStartTime } = draggingAudioRef.current;
+
+      const deltaX = e.clientX - startClientX;
+      const deltaT = deltaX / pixelsPerSecond;
+      const nextStart = Math.max(0, initialStartTime + deltaT);
+      const snapped = Math.round(nextStart * 10) / 10; // 0.1s snapping
+      onMoveAudio(id, snapped);
+    };
+
+    const onUp = () => {
+      if (draggingAudioRef.current) {
+        draggingAudioRef.current = null;
+        setDraggingAudioId(null);
+      }
+    };
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [onMoveAudio, pixelsPerSecond]);
 
   // Playhead position
   const playheadPosition = currentTime * pixelsPerSecond;
@@ -102,42 +267,6 @@ export default function Timeline({
     return () => window.removeEventListener('click', close);
   }, []);
 
-  // Drag and drop for reordering
-  const handleDragStart = useCallback((e: React.DragEvent, index: number) => {
-    e.dataTransfer.setData('clip-index', index.toString());
-    e.dataTransfer.effectAllowed = 'move';
-  }, []);
-
-  const handleDragOver = useCallback((e: React.DragEvent, index: number) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    setDragOverIndex(index);
-  }, []);
-
-  const handleDrop = useCallback((e: React.DragEvent, targetIndex: number) => {
-    e.preventDefault();
-    const sourceIndex = parseInt(e.dataTransfer.getData('clip-index'));
-    if (isNaN(sourceIndex) || sourceIndex === targetIndex) {
-      setDragOverIndex(null);
-      return;
-    }
-
-    const newClips = [...clips];
-    const videoClipIds = videoClips.map(c => c.id);
-    const sourceClipId = videoClipIds[sourceIndex];
-    const targetClipId = videoClipIds[targetIndex];
-
-    const sourceActualIndex = newClips.findIndex(c => c.id === sourceClipId);
-    const targetActualIndex = newClips.findIndex(c => c.id === targetClipId);
-
-    if (sourceActualIndex >= 0 && targetActualIndex >= 0) {
-      const [removed] = newClips.splice(sourceActualIndex, 1);
-      newClips.splice(targetActualIndex, 0, removed);
-      onReorderClips(newClips);
-    }
-    setDragOverIndex(null);
-  }, [clips, videoClips, onReorderClips]);
-
   const handleSplitAtPlayhead = useCallback((clipId: string) => {
     let accumulatedTime = 0;
     for (const clip of videoClips) {
@@ -163,7 +292,8 @@ export default function Timeline({
   }, []);
 
   // Total tracks height for dynamic sizing
-  const totalTracksHeight = TRACK_HEIGHT + (audioClips.length > 0 ? TRACK_HEIGHT - 10 : 0) + (textOverlays.length > 0 ? 32 : 0);
+  const audioTrackHeight = audioLanes.length > 0 ? audioLanes.length * (TRACK_HEIGHT - 10) : 0;
+  const totalTracksHeight = TRACK_HEIGHT + audioTrackHeight + (textOverlays.length > 0 ? 32 : 0);
 
   return (
     <div className={`bg-dark-800 border-t border-dark-700 flex flex-col shrink-0 ${isCollapsed ? 'h-10' : ''}`}>
@@ -247,12 +377,24 @@ export default function Timeline({
                   </div>
                   {/* Track Content */}
                   <div className="flex-1 relative">
+                    {/* Insertion marker while dragging */}
+                    {draggingVideoId && videoInsertionIndex !== null && (
+                      <div
+                        className="absolute top-1 bottom-1 w-px bg-primary-400 z-30 pointer-events-none"
+                        style={{
+                          left: `${videoClips.slice(0, videoInsertionIndex).reduce((sum, c) => {
+                            const d = (c.trimEnd || c.duration || 0) - (c.trimStart || 0);
+                            return sum + Math.max(0, d);
+                          }, 0) * pixelsPerSecond}px`,
+                        }}
+                      />
+                    )}
                     <div className="absolute left-0 top-0 bottom-0 flex">
                       {videoClips.map((clip, index) => {
                         const clipDuration = (clip.trimEnd || clip.duration || 0) - (clip.trimStart || 0);
                         const width = Math.max(clipDuration * pixelsPerSecond, 40);
                         const isSelected = selectedClip?.id === clip.id;
-                        const isDragTarget = dragOverIndex === index;
+                        const isDragging = draggingVideoId === clip.id;
 
                         return (
                           <div
@@ -262,7 +404,7 @@ export default function Timeline({
                                 ? 'bg-primary-600/30 border border-primary-500/60 z-10'
                                 : 'bg-dark-600/50 border border-dark-500/30 hover:bg-dark-600/80'
                               }
-                              ${isDragTarget ? 'border-l-2 border-l-primary-400' : ''}
+                              ${isDragging ? 'opacity-80 z-20' : ''}
                               rounded-md mx-0.5
                             `}
                             style={{ width: `${width}px` }}
@@ -271,14 +413,34 @@ export default function Timeline({
                               onSelectClip(clip);
                             }}
                             onContextMenu={e => handleContextMenu(e, clip.id)}
-                            draggable
-                            onDragStart={e => handleDragStart(e, index)}
-                            onDragOver={e => handleDragOver(e, index)}
-                            onDrop={e => handleDrop(e, index)}
-                            onDragLeave={() => setDragOverIndex(null)}
                           >
                             {/* Drag Handle */}
-                            <GripVertical className="w-3 h-3 text-white/20 mx-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
+                            <button
+                              type="button"
+                              className="mx-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity cursor-grab active:cursor-grabbing"
+                              title="Drag to move"
+                              onMouseDown={e => {
+                                e.stopPropagation();
+
+                                const ids = videoClips.map(v => v.id);
+                                const durations = videoClips.map(v => {
+                                  const d = (v.trimEnd || v.duration || 0) - (v.trimStart || 0);
+                                  return Math.max(0.001, d);
+                                });
+
+                                draggingVideoRef.current = {
+                                  clipId: clip.id,
+                                  sourceIndex: index,
+                                  insertionIndex: index,
+                                  videoClipIds: ids,
+                                  durations,
+                                };
+                                setDraggingVideoId(clip.id);
+                                setVideoInsertionIndex(index);
+                              }}
+                            >
+                              <GripVertical className="w-3 h-3 text-white/20" />
+                            </button>
 
                             {/* Clip Label */}
                             <div className="flex-1 min-w-0 px-1">
@@ -304,40 +466,82 @@ export default function Timeline({
                 </div>
 
                 {/* Audio Track */}
-                {audioClips.length > 0 && (
-                  <div className="relative flex border-t border-dark-700" style={{ height: `${TRACK_HEIGHT - 10}px` }}>
-                    {/* Track Label */}
+                {audioLanes.length > 0 && (
+                  <div className="relative flex border-t border-dark-700" style={{ height: `${audioTrackHeight}px` }}>
+                    {/* Track Label Column */}
                     <div
-                      className="shrink-0 flex items-center justify-center border-r border-dark-700 text-[10px] text-white/30 font-medium"
+                      className="shrink-0 border-r border-dark-700"
                       style={{ width: `${LABEL_WIDTH}px` }}
                     >
-                      🎵
+                      {audioLanes.map((_, laneIndex) => (
+                        <div
+                          key={laneIndex}
+                          className="flex items-center justify-center text-[10px] text-white/30 font-medium"
+                          style={{ height: `${TRACK_HEIGHT - 10}px` }}
+                        >
+                          {laneIndex === 0 ? '🎵' : ''}
+                        </div>
+                      ))}
                     </div>
                     {/* Track Content */}
                     <div className="flex-1 relative">
-                      {audioClips.map(clip => {
-                        const startX = (clip.startTime || 0) * pixelsPerSecond;
-                        const clipDuration = (clip.trimEnd || clip.duration || 10) - (clip.trimStart || 0);
-                        const width = Math.max(clipDuration * pixelsPerSecond, 30);
+                      {audioLanes.map((lane, laneIndex) => (
+                        <div
+                          key={laneIndex}
+                          className="relative border-b border-dark-700/50"
+                          style={{ height: `${TRACK_HEIGHT - 10}px` }}
+                        >
+                          {lane.map(clip => {
+                            const id = clip.timelineId || clip.id;
+                            const startX = (clip.startTime || 0) * pixelsPerSecond;
+                            const clipDuration = (clip.trimEnd || clip.duration || 10) - (clip.trimStart || 0);
+                            const width = Math.max(clipDuration * pixelsPerSecond, 30);
+                            const isSelected = selectedClip?.id === clip.id;
+                            const isDragging = draggingAudioId === id;
 
-                        return (
-                          <div
-                            key={clip.timelineId || clip.id}
-                            className="absolute h-full bg-emerald-600/20 border border-emerald-500/30 rounded-md flex items-center px-2 group"
-                            style={{ left: `${startX}px`, width: `${width}px`, top: 0 }}
-                          >
-                            <p className="text-[10px] text-emerald-400/60 truncate">{clip.name}</p>
-                            {onRemoveAudio && (
-                              <button
-                                onClick={() => onRemoveAudio(clip.timelineId || clip.id)}
-                                className="opacity-0 group-hover:opacity-100 ml-auto text-white/30 hover:text-red-400"
+                            return (
+                              <div
+                                key={id}
+                                className={`absolute h-full rounded-md flex items-center px-2 group cursor-pointer transition-colors ${
+                                  isSelected
+                                    ? 'bg-emerald-600/30 border border-emerald-400/70'
+                                    : 'bg-emerald-600/20 border border-emerald-500/30 hover:bg-emerald-600/25'
+                                } ${isDragging ? 'opacity-80' : ''}`}
+                                style={{ left: `${startX}px`, width: `${width}px`, top: 0 }}
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  const asset = clips.find(c => c.id === clip.id);
+                                  onSelectClip(asset || clip);
+                                }}
+                                onMouseDown={e => {
+                                  if (!onMoveAudio) return;
+                                  e.stopPropagation();
+                                  draggingAudioRef.current = {
+                                    id,
+                                    startClientX: e.clientX,
+                                    initialStartTime: clip.startTime || 0,
+                                  };
+                                  setDraggingAudioId(id);
+                                }}
+                                title="Drag to move in time"
                               >
-                                <Trash2 className="w-2.5 h-2.5" />
-                              </button>
-                            )}
-                          </div>
-                        );
-                      })}
+                                <p className="text-[10px] text-emerald-400/60 truncate">{clip.name}</p>
+                                {onRemoveAudio && (
+                                  <button
+                                    onClick={e => {
+                                      e.stopPropagation();
+                                      onRemoveAudio(id);
+                                    }}
+                                    className="opacity-0 group-hover:opacity-100 ml-auto text-white/30 hover:text-red-400"
+                                  >
+                                    <Trash2 className="w-2.5 h-2.5" />
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ))}
                     </div>
                   </div>
                 )}
