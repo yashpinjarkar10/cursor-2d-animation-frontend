@@ -19,6 +19,7 @@ interface ChatPromptProps {
     isGenerating: boolean;
     generationProgress?: number;
     generationMessage?: string;
+    generationError?: string | null;
 }
 
 const SUGGESTION_CHIPS = [
@@ -35,6 +36,7 @@ export default function ChatPrompt({
     isGenerating,
     generationProgress = 0,
     generationMessage = '',
+    generationError = null,
 }: ChatPromptProps) {
     const [prompt, setPrompt] = useState('');
     const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -49,19 +51,31 @@ export default function ChatPrompt({
 
     // Update generating message status
     useEffect(() => {
-        if (isGenerating && messages.length > 0) {
-            const lastMessage = messages[messages.length - 1];
-            if (lastMessage.role === 'assistant' && lastMessage.status === 'generating') {
-                setMessages(prev =>
-                    prev.map((m, i) =>
-                        i === prev.length - 1
-                            ? { ...m, progress: generationProgress, progressMessage: generationMessage }
-                            : m
-                    )
-                );
+        if (!isGenerating) return;
+
+        setMessages(prev => {
+            if (prev.length === 0) return prev;
+            const lastIndex = prev.length - 1;
+            const lastMessage = prev[lastIndex];
+            if (lastMessage.role !== 'assistant' || lastMessage.status !== 'generating') return prev;
+
+            // Prevent infinite loops: if nothing changed, keep the same array reference.
+            if (
+                lastMessage.progress === generationProgress &&
+                lastMessage.progressMessage === generationMessage
+            ) {
+                return prev;
             }
-        }
-    }, [generationProgress, generationMessage, isGenerating, messages]);
+
+            const next = [...prev];
+            next[lastIndex] = {
+                ...lastMessage,
+                progress: generationProgress,
+                progressMessage: generationMessage,
+            };
+            return next;
+        });
+    }, [generationProgress, generationMessage, isGenerating]);
 
     const handleSubmit = () => {
         const trimmedPrompt = prompt.trim();
@@ -93,18 +107,35 @@ export default function ChatPrompt({
 
     // Update on completion
     useEffect(() => {
-        if (!isGenerating && messages.length > 0) {
-            const lastMsg = messages[messages.length - 1];
-            if (lastMsg.role === 'assistant' && lastMsg.status === 'generating') {
-                setMessages(prev =>
-                    prev.map((m, i) =>
-                        i === prev.length - 1
-                            ? { ...m, status: 'complete', content: 'Animation generated successfully! ✓', progress: 100, progressMessage: 'Done!' }
-                            : m
-                    )
-                );
-            }
-        }
+        if (isGenerating) return;
+
+        setMessages(prev => {
+            if (prev.length === 0) return prev;
+            const lastIndex = prev.length - 1;
+            const lastMsg = prev[lastIndex];
+            if (lastMsg.role !== 'assistant' || lastMsg.status !== 'generating') return prev;
+
+            const next = [...prev];
+            next[lastIndex] = generationError
+                ? {
+                    ...lastMsg,
+                    status: 'error',
+                    content: `Failed to generate animation: ${generationError}`,
+                    progress: lastMsg.progress ?? 0,
+                    progressMessage: 'Error',
+                }
+                : {
+                    ...lastMsg,
+                    status: 'complete',
+                    content: 'Animation generated successfully! ✓',
+                    progress: 100,
+                    progressMessage: 'Done!',
+                };
+            return next;
+        });
+        // NOTE: `generationError` is set before `isGenerating` flips to false in the parent.
+        // This effect only needs to run on the generating→done transition.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isGenerating]);
 
     const handleKeyDown = (e: React.KeyboardEvent) => {

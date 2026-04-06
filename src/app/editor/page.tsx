@@ -42,6 +42,7 @@ export default function EditorPage() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationProgress, setGenerationProgress] = useState(0);
   const [generationMessage, setGenerationMessage] = useState('');
+  const [generationError, setGenerationError] = useState<string | null>(null);
 
   // Layout state
   const [playerHeight, setPlayerHeight] = useState(350);
@@ -180,6 +181,7 @@ export default function EditorPage() {
     setIsGenerating(true);
     setGenerationProgress(0);
     setGenerationMessage('Starting...');
+    setGenerationError(null);
 
     const taskId = uuidv4();
     setGeneratingTasks(prev => [
@@ -241,13 +243,18 @@ export default function EditorPage() {
         setSelectedClip(newClip);
         setCurrentVideo(result.videoUrl);
         setCurrentCode(clipCode);
+        setGenerationError(null);
         showToast('Video generated successfully!', 'success');
       } else {
-        showToast(`Failed to generate video: ${result.error}`, 'error');
+        const errorMessage = result.error || 'Unknown error';
+        setGenerationError(errorMessage);
+        showToast(`Failed to generate video: ${errorMessage}`, 'error');
       }
     } catch (error: unknown) {
       setGeneratingTasks(prev => prev.filter(t => t.taskId !== taskId));
-      showToast(`Error: ${(error as Error).message}`, 'error');
+      const errorMessage = (error as Error).message || 'Unknown error';
+      setGenerationError(errorMessage);
+      showToast(`Error: ${errorMessage}`, 'error');
     } finally {
       setIsGenerating(false);
     }
@@ -628,6 +635,7 @@ export default function EditorPage() {
               isGenerating={isGenerating}
               generationProgress={generationProgress}
               generationMessage={generationMessage}
+              generationError={generationError}
             />
           </div>
           {/* Resize Handle */}

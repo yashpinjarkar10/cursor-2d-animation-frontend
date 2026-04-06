@@ -1,5 +1,34 @@
 const DEFAULT_BACKEND_URL = "http://localhost:8000";
 
+function normalizeBackendBaseUrl(raw: string): string {
+  let value = raw;
+
+  // Common copy/paste issues from dashboards and terminals.
+  value = value
+    .trim()
+    .replace(/^["']+|["']+$/g, "")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .trim();
+
+  // If the user provided only a host (no scheme), pick a sensible default.
+  if (!/^https?:\/\//i.test(value)) {
+    const looksLocal =
+      /^localhost(?::\d+)?$/i.test(value) ||
+      /^127\.0\.0\.1(?::\d+)?$/.test(value) ||
+      /^0\.0\.0\.0(?::\d+)?$/.test(value) ||
+      /^10\./.test(value) ||
+      /^192\.168\./.test(value) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(value);
+
+    value = `${looksLocal ? "http" : "https"}://${value}`;
+  }
+
+  const url = new URL(value);
+
+  // Ensure we always store an origin only (no path/query/hash).
+  return url.origin.replace(/\/+$/, "");
+}
+
 export function getBackendBaseUrl(): string {
   // Prefer a server-only env var if you add it in Cloudflare dashboard.
   const url =
@@ -7,7 +36,7 @@ export function getBackendBaseUrl(): string {
     process.env.NEXT_PUBLIC_BACKEND_URL ||
     DEFAULT_BACKEND_URL;
 
-  return url.replace(/\/+$/, "");
+  return normalizeBackendBaseUrl(url);
 }
 
 export function buildBackendUrl(pathname: string): string {
