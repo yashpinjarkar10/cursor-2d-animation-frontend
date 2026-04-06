@@ -15,6 +15,11 @@ node_modules/
 /.next/
 /out/
 
+# opennext
+.open-next/
+.dev.vars
+.wrangler/
+
 # production
 /build
 
