@@ -42,9 +42,18 @@ export interface Clip {
   videoUrl?: string;
   videoPath?: string;
   audioPath?: string;
+  // Optional IndexedDB persistence keys for blob media.
+  // When present, the app can restore media after refresh.
+  persistedVideoKey?: string;
+  persistedAudioKey?: string;
   // Web Speech API (free) text-to-speech support for audio clips.
   ttsText?: string;
+  // BCP-47 language tag (e.g. "en-US", "hi-IN") used to improve pronunciation and
+  // provide a best-effort fallback when the exact voice name isn't available.
+  ttsLang?: string;
   ttsVoice?: string;
+  // Camb.ai voice ID (integer). Used by the /api/tts proxy.
+  ttsVoiceId?: number;
   ttsRate?: number;
   ttsPitch?: number;
   ttsVolume?: number;

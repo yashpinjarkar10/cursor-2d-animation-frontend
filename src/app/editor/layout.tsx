@@ -11,7 +11,7 @@ export default function EditorLayout({
   children: React.ReactNode;
 }) {
   return (
-    <div className="h-screen w-screen overflow-hidden bg-dark-900 text-white">
+    <div className="h-screen w-screen overflow-hidden text-white studio-shell-bg">
       {children}
     </div>
   );

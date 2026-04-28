@@ -8,9 +8,10 @@
     "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
     "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "eslint . --cache --max-warnings=0"
   },
   "dependencies": {
+    "@camb-ai/sdk": "^1.0.4",
     "axios": "^1.13.6",
     "clsx": "^2.1.1",
     "framer-motion": "^12.34.3",
@@ -22,10 +23,10 @@
     "uuid": "^13.0.0"
   },
   "devDependencies": {
+    "@opennextjs/cloudflare": "^1.18.0",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
-    "@opennextjs/cloudflare": "^1.18.0",
     "eslint": "^9",
     "eslint-config-next": "^16.2.2",
     "postcss": "^8",

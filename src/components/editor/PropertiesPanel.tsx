@@ -1,8 +1,39 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
-import { Type, Plus, Trash2, ChevronDown, ChevronUp } from 'lucide-react';
+import { useMemo, useState, useCallback } from 'react';
+import { Type, Plus, Trash2, ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
 import type { Clip, TextOverlay } from '@/lib/api';
+
+/**
+ * Curated language list — Indian + English languages.
+ * Codes come from the Camb.ai /tts-stream API spec (BCP-47 locale enum).
+ * https://docs.camb.ai/api-reference/endpoint/create-tts-stream
+ */
+const CAMB_LANGUAGES = [
+    { code: 'en-us', label: 'English (US)' },
+    { code: 'en-uk', label: 'English (UK)' },
+    { code: 'en-in', label: 'English (India)' },
+    { code: 'en-au', label: 'English (Australia)' },
+    { code: 'hi-in', label: 'Hindi' },
+    { code: 'ta-in', label: 'Tamil' },
+    { code: 'te-in', label: 'Telugu' },
+    { code: 'bn-in', label: 'Bengali (India)' },
+    { code: 'mr-in', label: 'Marathi' },
+    { code: 'kn-in', label: 'Kannada' },
+    { code: 'ml-in', label: 'Malayalam' },
+    { code: 'pa-in', label: 'Punjabi' },
+    { code: 'as-in', label: 'Assamese' },
+] as const;
+
+/**
+ * Curated voice options.
+ * IDs from the Camb.ai /list-voices response (documented examples).
+ * https://docs.camb.ai/api-reference/endpoint/list-voices
+ */
+const CAMB_VOICES = [
+    { id: 147320, name: 'Gary', gender: 'Male', description: 'Rich, warm voice with dynamic expression' },
+    { id: 20305, name: 'Alice', gender: 'Female', description: 'Warm, steady voice with calm tone' },
+] as const;
 
 interface PropertiesPanelProps {
     selectedClip: Clip | null;
@@ -10,7 +41,9 @@ interface PropertiesPanelProps {
     onAddText: (textData: Partial<TextOverlay>) => void;
     onAddTtsAudio: (data: {
         text: string;
+        lang?: string;
         voice?: string;
+        voiceId?: number;
         rate?: number;
         pitch?: number;
         volume?: number;
@@ -40,43 +73,14 @@ export default function PropertiesPanel({
     const [showTts, setShowTts] = useState(true);
     const [newText, setNewText] = useState('');
     const [ttsText, setTtsText] = useState('');
-    const [ttsSupported, setTtsSupported] = useState(true);
-    const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
-    const [ttsVoice, setTtsVoice] = useState<string>('');
-    const [ttsRate, setTtsRate] = useState<number>(1);
-    const [ttsPitch, setTtsPitch] = useState<number>(1);
-    const [ttsVolume, setTtsVolume] = useState<number>(1);
+    const [ttsLang, setTtsLang] = useState<string>('en-us');
+    const [ttsVoiceId, setTtsVoiceId] = useState<number>(CAMB_VOICES[0].id);
+    const [isPreviewing, setIsPreviewing] = useState(false);
+    const [previewAudio, setPreviewAudio] = useState<HTMLAudioElement | null>(null);
 
     const selectedIsSpeechClip = useMemo(() => {
         return Boolean(selectedClip && selectedClip.type === 'audio' && selectedClip.ttsText && selectedClip.ttsText.trim());
     }, [selectedClip]);
-
-    useEffect(() => {
-        if (typeof window === 'undefined') return;
-
-        const supported =
-            typeof window.speechSynthesis !== 'undefined' &&
-            typeof window.SpeechSynthesisUtterance !== 'undefined';
-        setTtsSupported(supported);
-        if (!supported) return;
-
-        const load = () => {
-            try {
-                const list = window.speechSynthesis.getVoices();
-                setVoices(list);
-                if (!ttsVoice && list.length > 0) {
-                    setTtsVoice(list[0].name);
-                }
-            } catch {
-                // ignore
-            }
-        };
-
-        load();
-        window.speechSynthesis.addEventListener('voiceschanged', load);
-        return () => window.speechSynthesis.removeEventListener('voiceschanged', load);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
 
     const handleAddText = () => {
         if (!newText.trim()) return;
@@ -94,44 +98,123 @@ export default function PropertiesPanel({
 
     const handleAddTts = () => {
         const text = ttsText.trim();
-        if (!text) return;
+        if (!text || text.length < 3) return;
+        const voice = CAMB_VOICES.find(v => v.id === ttsVoiceId);
         onAddTtsAudio({
             text,
-            voice: ttsVoice || undefined,
-            rate: ttsRate,
-            pitch: ttsPitch,
-            volume: ttsVolume,
+            lang: ttsLang || undefined,
+            voice: voice ? voice.name : undefined,
+            voiceId: ttsVoiceId,
         });
         setTtsText('');
     };
 
-    const handlePreviewTts = () => {
-        if (typeof window === 'undefined') return;
-        if (!ttsSupported) return;
+    /**
+     * Preview TTS by calling /api/tts and playing the returned audio.
+     */
+    const handlePreviewTts = useCallback(async () => {
         const text = ttsText.trim();
-        if (!text) return;
+        if (!text || text.length < 3) return;
 
-        try {
-            window.speechSynthesis.cancel();
-            const u = new SpeechSynthesisUtterance(text);
-            u.rate = ttsRate;
-            u.pitch = ttsPitch;
-            u.volume = ttsVolume;
-            if (ttsVoice) {
-                const v = voices.find(vv => vv.name === ttsVoice);
-                if (v) u.voice = v;
+        // Stop any existing preview
+        if (previewAudio) {
+            try { previewAudio.pause(); } catch { /* ignore */ }
+            if (previewAudio.src.startsWith('blob:')) {
+                URL.revokeObjectURL(previewAudio.src);
             }
-            window.speechSynthesis.speak(u);
-        } catch {
-            // ignore
         }
-    };
+
+        setIsPreviewing(true);
+        try {
+            const response = await fetch('/api/tts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    text,
+                    language: ttsLang,
+                    voice_id: ttsVoiceId,
+                }),
+            });
+
+            if (!response.ok) {
+                const err = await response.json().catch(() => ({ error: 'Unknown error' }));
+                console.error('TTS preview error:', err);
+                return;
+            }
+
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            audio.onended = () => {
+                URL.revokeObjectURL(url);
+                setPreviewAudio(null);
+            };
+            setPreviewAudio(audio);
+            await audio.play();
+        } catch (err) {
+            console.error('TTS preview failed:', err);
+        } finally {
+            setIsPreviewing(false);
+        }
+    }, [ttsText, ttsLang, ttsVoiceId, previewAudio]);
+
+    /**
+     * Preview a selected speech clip using Camb.ai.
+     */
+    const handlePreviewClipTts = useCallback(async () => {
+        if (!selectedClip?.ttsText?.trim()) return;
+        const text = selectedClip.ttsText.trim();
+        if (text.length < 3) return;
+
+        if (previewAudio) {
+            try { previewAudio.pause(); } catch { /* ignore */ }
+            if (previewAudio.src.startsWith('blob:')) {
+                URL.revokeObjectURL(previewAudio.src);
+            }
+        }
+
+        setIsPreviewing(true);
+        try {
+            const voiceId = selectedClip.ttsVoiceId || CAMB_VOICES[0].id;
+            const lang = selectedClip.ttsLang || 'en-us';
+
+            const response = await fetch('/api/tts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    text,
+                    language: lang,
+                    voice_id: voiceId,
+                }),
+            });
+
+            if (!response.ok) {
+                const err = await response.json().catch(() => ({ error: 'Unknown error' }));
+                console.error('TTS preview error:', err);
+                return;
+            }
+
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            audio.onended = () => {
+                URL.revokeObjectURL(url);
+                setPreviewAudio(null);
+            };
+            setPreviewAudio(audio);
+            await audio.play();
+        } catch (err) {
+            console.error('TTS clip preview failed:', err);
+        } finally {
+            setIsPreviewing(false);
+        }
+    }, [selectedClip, previewAudio]);
 
     return (
-        <div className="w-64 bg-dark-800 border-l border-dark-700 flex flex-col overflow-hidden shrink-0">
+        <div className="w-56 lg:w-[15.5rem] xl:w-64 bg-zinc-900/70 border-l border-white/10 flex flex-col overflow-hidden shrink-0 backdrop-blur-sm">
             {/* Header */}
-            <div className="px-3 py-3 border-b border-dark-700">
-                <h3 className="text-xs font-semibold text-white/60 uppercase tracking-wider">Properties</h3>
+            <div className="px-3 py-3 border-b border-white/10">
+                <h3 className="studio-kicker">Properties</h3>
             </div>
 
             <div className="flex-1 overflow-y-auto">
@@ -139,7 +222,7 @@ export default function PropertiesPanel({
                 <div>
                     <button
                         onClick={() => setShowClipProps(!showClipProps)}
-                        className="w-full flex items-center justify-between px-3 py-2 hover:bg-dark-700/30 transition-colors"
+                        className="w-full flex items-center justify-between px-3 py-2 hover:bg-white/5 studio-interactive"
                     >
                         <span className="text-xs font-medium text-white/70">Clip Properties</span>
                         {showClipProps ? <ChevronUp className="w-3 h-3 text-white/30" /> : <ChevronDown className="w-3 h-3 text-white/30" />}
@@ -203,10 +286,10 @@ export default function PropertiesPanel({
                 </div>
 
                 {/* Text Overlays */}
-                <div className="border-t border-dark-700">
+                <div className="border-t border-white/10">
                     <button
                         onClick={() => setShowTextOverlays(!showTextOverlays)}
-                        className="w-full flex items-center justify-between px-3 py-2 hover:bg-dark-700/30 transition-colors"
+                        className="w-full flex items-center justify-between px-3 py-2 hover:bg-white/5 studio-interactive"
                     >
                         <div className="flex items-center gap-1.5">
                             <Type className="w-3 h-3 text-amber-400" />
@@ -237,9 +320,9 @@ export default function PropertiesPanel({
                                 <div
                                     key={overlay.id}
                                     onClick={() => onSelectText(overlay.id)}
-                                    className={`p-2.5 rounded-lg cursor-pointer transition-all ${selectedTextOverlay?.id === overlay.id
-                                            ? 'bg-amber-600/15 border border-amber-500/30'
-                                            : 'bg-dark-700/30 border border-transparent hover:border-dark-600'
+                                    className={`p-2.5 rounded-lg cursor-pointer studio-interactive ${selectedTextOverlay?.id === overlay.id
+                                            ? 'bg-white/[0.14] border border-white/22'
+                                            : 'bg-white/[0.04] border border-transparent hover:border-white/15'
                                         }`}
                                 >
                                     <div className="flex items-center justify-between mb-2">
@@ -265,28 +348,6 @@ export default function PropertiesPanel({
                                             />
                                             <div className="grid grid-cols-2 gap-2">
                                                 <div>
-                                                    <label className="text-[9px] text-white/30">Start (s)</label>
-                                                    <input
-                                                        type="number"
-                                                        step="0.1"
-                                                        className="input !text-xs mt-0.5"
-                                                        value={overlay.startTime}
-                                                        onChange={e => onUpdateText({ ...overlay, startTime: parseFloat(e.target.value) || 0 })}
-                                                    />
-                                                </div>
-                                                <div>
-                                                    <label className="text-[9px] text-white/30">Duration (s)</label>
-                                                    <input
-                                                        type="number"
-                                                        step="0.1"
-                                                        className="input !text-xs mt-0.5"
-                                                        value={overlay.duration}
-                                                        onChange={e => onUpdateText({ ...overlay, duration: parseFloat(e.target.value) || 1 })}
-                                                    />
-                                                </div>
-                                            </div>
-                                            <div className="grid grid-cols-2 gap-2">
-                                                <div>
                                                     <label className="text-[9px] text-white/30">Font Size</label>
                                                     <input
                                                         type="number"
@@ -307,30 +368,9 @@ export default function PropertiesPanel({
                                                     />
                                                 </div>
                                             </div>
-                                            <div className="grid grid-cols-2 gap-2">
-                                                <div>
-                                                    <label className="text-[9px] text-white/30">X Position (%)</label>
-                                                    <input
-                                                        type="range"
-                                                        min="0"
-                                                        max="100"
-                                                        className="w-full mt-0.5"
-                                                        value={overlay.x}
-                                                        onChange={e => onUpdateText({ ...overlay, x: parseInt(e.target.value) })}
-                                                    />
-                                                </div>
-                                                <div>
-                                                    <label className="text-[9px] text-white/30">Y Position (%)</label>
-                                                    <input
-                                                        type="range"
-                                                        min="0"
-                                                        max="100"
-                                                        className="w-full mt-0.5"
-                                                        value={overlay.y}
-                                                        onChange={e => onUpdateText({ ...overlay, y: parseInt(e.target.value) })}
-                                                    />
-                                                </div>
-                                            </div>
+                                            <p className="text-[10px] text-white/35">
+                                                Drag text in preview to position. Drag the text bar in Timeline to set start and duration.
+                                            </p>
                                         </div>
                                     )}
                                 </div>
@@ -339,11 +379,11 @@ export default function PropertiesPanel({
                     )}
                 </div>
 
-                {/* Text to Speech */}
-                <div className="border-t border-dark-700">
+                {/* Text to Speech (Camb.ai) */}
+                <div className="border-t border-white/10">
                     <button
                         onClick={() => setShowTts(!showTts)}
-                        className="w-full flex items-center justify-between px-3 py-2 hover:bg-dark-700/30 transition-colors"
+                        className="w-full flex items-center justify-between px-3 py-2 hover:bg-white/5 studio-interactive"
                     >
                         <span className="text-xs font-medium text-white/70">Text to Speech</span>
                         {showTts ? <ChevronUp className="w-3 h-3 text-white/30" /> : <ChevronDown className="w-3 h-3 text-white/30" />}
@@ -351,101 +391,66 @@ export default function PropertiesPanel({
 
                     {showTts && (
                         <div className="px-3 pb-3 space-y-2">
-                            {!ttsSupported && (
-                                <p className="text-[10px] text-white/30">
-                                    Text-to-speech is not supported in this browser.
-                                </p>
-                            )}
                             <textarea
                                 className="input !text-xs min-h-[70px] resize-none"
-                                placeholder="Type text to speak (free, browser TTS)..."
+                                placeholder="Type text to speak (min 3 chars)..."
                                 value={ttsText}
                                 onChange={e => setTtsText(e.target.value)}
                             />
 
+                            {/* Language */}
+                            <div>
+                                <label className="text-[10px] text-white/40 uppercase tracking-wider">Language</label>
+                                <select
+                                    className="input !text-xs mt-1"
+                                    value={ttsLang}
+                                    onChange={e => setTtsLang(e.target.value)}
+                                >
+                                    {CAMB_LANGUAGES.map(l => (
+                                        <option key={l.code} value={l.code}>
+                                            {l.label}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            {/* Voice */}
                             <div>
                                 <label className="text-[10px] text-white/40 uppercase tracking-wider">Voice</label>
                                 <select
                                     className="input !text-xs mt-1"
-                                    value={ttsVoice}
-                                    onChange={e => setTtsVoice(e.target.value)}
-                                    disabled={!ttsSupported || voices.length === 0}
+                                    value={ttsVoiceId}
+                                    onChange={e => setTtsVoiceId(parseInt(e.target.value))}
                                 >
-                                    {voices.length === 0 ? (
-                                        <option value="">Loading voices…</option>
-                                    ) : (
-                                        voices.map(v => (
-                                            <option key={`${v.name}-${v.lang}`} value={v.name}>
-                                                {v.name} ({v.lang})
-                                            </option>
-                                        ))
-                                    )}
+                                    {CAMB_VOICES.map(v => (
+                                        <option key={v.id} value={v.id}>
+                                            {v.name} ({v.gender}) — {v.description}
+                                        </option>
+                                    ))}
                                 </select>
-                            </div>
-
-                            <div className="grid grid-cols-2 gap-2">
-                                <div>
-                                    <label className="text-[10px] text-white/40 uppercase tracking-wider">Rate</label>
-                                    <input
-                                        type="range"
-                                        min="0.5"
-                                        max="2"
-                                        step="0.1"
-                                        className="w-full mt-2"
-                                        value={ttsRate}
-                                        onChange={e => setTtsRate(parseFloat(e.target.value))}
-                                        disabled={!ttsSupported}
-                                    />
-                                </div>
-                                <div>
-                                    <label className="text-[10px] text-white/40 uppercase tracking-wider">Pitch</label>
-                                    <input
-                                        type="range"
-                                        min="0"
-                                        max="2"
-                                        step="0.1"
-                                        className="w-full mt-2"
-                                        value={ttsPitch}
-                                        onChange={e => setTtsPitch(parseFloat(e.target.value))}
-                                        disabled={!ttsSupported}
-                                    />
-                                </div>
-                            </div>
-
-                            <div>
-                                <label className="text-[10px] text-white/40 uppercase tracking-wider">Volume</label>
-                                <input
-                                    type="range"
-                                    min="0"
-                                    max="1"
-                                    step="0.05"
-                                    className="w-full mt-2"
-                                    value={ttsVolume}
-                                    onChange={e => setTtsVolume(parseFloat(e.target.value))}
-                                    disabled={!ttsSupported}
-                                />
                             </div>
 
                             <div className="flex gap-2">
                                 <button
-                                    className="btn btn-secondary flex-1"
+                                    className="btn btn-secondary flex-1 flex items-center justify-center gap-1"
                                     onClick={handlePreviewTts}
-                                    disabled={!ttsSupported || !ttsText.trim()}
+                                    disabled={isPreviewing || ttsText.trim().length < 3}
                                     title="Preview speech"
                                 >
+                                    {isPreviewing && <Loader2 className="w-3 h-3 animate-spin" />}
                                     Preview
                                 </button>
                                 <button
-                                    className="btn btn-primary flex-1"
+                                    className="btn btn-primary flex-1 flex items-center justify-center gap-1"
                                     onClick={handleAddTts}
-                                    disabled={!ttsSupported || !ttsText.trim()}
+                                    disabled={ttsText.trim().length < 3}
                                     title="Add speech clip to timeline"
                                 >
                                     Add
                                 </button>
                             </div>
                             <p className="text-[10px] text-white/30">
-                                Adds a speech clip at the current playhead time (preview playback only).
+                                Powered by Camb.ai — adds a speech clip at the current playhead time.
                             </p>
                         </div>
                     )}
@@ -453,7 +458,7 @@ export default function PropertiesPanel({
 
                 {/* Speech Clip Editor */}
                 {selectedIsSpeechClip && selectedClip && (
-                    <div className="border-t border-dark-700">
+                    <div className="border-t border-white/10">
                         <div className="px-3 py-2 text-xs font-medium text-white/70">Speech Clip</div>
                         <div className="px-3 pb-3 space-y-2">
                             <textarea
@@ -462,93 +467,48 @@ export default function PropertiesPanel({
                                 onChange={e => onUpdateClip({ ...selectedClip, ttsText: e.target.value })}
                             />
 
+                            {/* Language */}
+                            <div>
+                                <label className="text-[10px] text-white/40 uppercase tracking-wider">Language</label>
+                                <select
+                                    className="input !text-xs mt-1"
+                                    value={selectedClip.ttsLang || 'en-us'}
+                                    onChange={e => onUpdateClip({ ...selectedClip, ttsLang: e.target.value })}
+                                >
+                                    {CAMB_LANGUAGES.map(l => (
+                                        <option key={l.code} value={l.code}>
+                                            {l.label}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            {/* Voice */}
                             <div>
                                 <label className="text-[10px] text-white/40 uppercase tracking-wider">Voice</label>
                                 <select
                                     className="input !text-xs mt-1"
-                                    value={selectedClip.ttsVoice || ''}
-                                    onChange={e => onUpdateClip({ ...selectedClip, ttsVoice: e.target.value })}
-                                    disabled={!ttsSupported || voices.length === 0}
+                                    value={selectedClip.ttsVoiceId || CAMB_VOICES[0].id}
+                                    onChange={e => onUpdateClip({
+                                        ...selectedClip,
+                                        ttsVoiceId: parseInt(e.target.value),
+                                        ttsVoice: CAMB_VOICES.find(v => v.id === parseInt(e.target.value))?.name,
+                                    })}
                                 >
-                                    {voices.length === 0 ? (
-                                        <option value="">Loading voices…</option>
-                                    ) : (
-                                        voices.map(v => (
-                                            <option key={`${v.name}-${v.lang}`} value={v.name}>
-                                                {v.name} ({v.lang})
-                                            </option>
-                                        ))
-                                    )}
+                                    {CAMB_VOICES.map(v => (
+                                        <option key={v.id} value={v.id}>
+                                            {v.name} ({v.gender})
+                                        </option>
+                                    ))}
                                 </select>
                             </div>
 
-                            <div className="grid grid-cols-2 gap-2">
-                                <div>
-                                    <label className="text-[10px] text-white/40 uppercase tracking-wider">Rate</label>
-                                    <input
-                                        type="range"
-                                        min="0.5"
-                                        max="2"
-                                        step="0.1"
-                                        className="w-full mt-2"
-                                        value={selectedClip.ttsRate ?? 1}
-                                        onChange={e => onUpdateClip({ ...selectedClip, ttsRate: parseFloat(e.target.value) })}
-                                        disabled={!ttsSupported}
-                                    />
-                                </div>
-                                <div>
-                                    <label className="text-[10px] text-white/40 uppercase tracking-wider">Pitch</label>
-                                    <input
-                                        type="range"
-                                        min="0"
-                                        max="2"
-                                        step="0.1"
-                                        className="w-full mt-2"
-                                        value={selectedClip.ttsPitch ?? 1}
-                                        onChange={e => onUpdateClip({ ...selectedClip, ttsPitch: parseFloat(e.target.value) })}
-                                        disabled={!ttsSupported}
-                                    />
-                                </div>
-                            </div>
-
-                            <div>
-                                <label className="text-[10px] text-white/40 uppercase tracking-wider">Volume</label>
-                                <input
-                                    type="range"
-                                    min="0"
-                                    max="1"
-                                    step="0.05"
-                                    className="w-full mt-2"
-                                    value={selectedClip.ttsVolume ?? 1}
-                                    onChange={e => onUpdateClip({ ...selectedClip, ttsVolume: parseFloat(e.target.value) })}
-                                    disabled={!ttsSupported}
-                                />
-                            </div>
-
                             <button
-                                className="btn btn-secondary w-full"
-                                onClick={() => {
-                                    if (typeof window === 'undefined') return;
-                                    if (!ttsSupported) return;
-                                    const text = (selectedClip.ttsText || '').trim();
-                                    if (!text) return;
-                                    try {
-                                        window.speechSynthesis.cancel();
-                                        const u = new SpeechSynthesisUtterance(text);
-                                        u.rate = selectedClip.ttsRate ?? 1;
-                                        u.pitch = selectedClip.ttsPitch ?? 1;
-                                        u.volume = selectedClip.ttsVolume ?? 1;
-                                        if (selectedClip.ttsVoice) {
-                                            const v = voices.find(vv => vv.name === selectedClip.ttsVoice);
-                                            if (v) u.voice = v;
-                                        }
-                                        window.speechSynthesis.speak(u);
-                                    } catch {
-                                        // ignore
-                                    }
-                                }}
-                                disabled={!ttsSupported || !(selectedClip.ttsText || '').trim()}
+                                className="btn btn-secondary w-full flex items-center justify-center gap-1"
+                                onClick={handlePreviewClipTts}
+                                disabled={isPreviewing || !(selectedClip.ttsText || '').trim() || (selectedClip.ttsText || '').trim().length < 3}
                             >
+                                {isPreviewing && <Loader2 className="w-3 h-3 animate-spin" />}
                                 Preview Clip
                             </button>
                         </div>

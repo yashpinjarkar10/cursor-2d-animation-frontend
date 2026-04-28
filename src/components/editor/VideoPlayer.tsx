@@ -3,7 +3,7 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import {
   Play, Pause, Volume2, VolumeX, SkipBack, SkipForward,
-  Maximize2, Minimize2, Code, PanelRight
+  Maximize2, Minimize2, Code
 } from 'lucide-react';
 import type { Clip, TextOverlay } from '@/lib/api';
 
@@ -26,9 +26,8 @@ interface VideoPlayerProps {
   isFullscreen: boolean;
   showCodeEditor: boolean;
   onToggleCodeEditor: () => void;
-  showRightPanel: boolean;
-  onToggleRightPanel: () => void;
   selectedTextId?: string;
+  onSelectTextOverlay?: (textId: string) => void;
   onUpdateTextOverlay?: (textId: string, updates: Partial<TextOverlay>) => void;
 }
 
@@ -53,14 +52,13 @@ export default function VideoPlayer({
   isFullscreen,
   showCodeEditor,
   onToggleCodeEditor,
-  showRightPanel,
-  onToggleRightPanel,
   selectedTextId,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  onSelectTextOverlay,
   onUpdateTextOverlay,
 }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const [localCurrentTime, setLocalCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(1);
@@ -73,6 +71,17 @@ export default function VideoPlayer({
   // Resize drag state
   const isDragging = useRef(false);
   const lastY = useRef(0);
+
+  // Text overlay drag state
+  const draggingTextRef = useRef<{
+    id: string;
+    startClientX: number;
+    startClientY: number;
+    initialX: number;
+    initialY: number;
+  } | null>(null);
+  const textDragRafRef = useRef<number | null>(null);
+  const textDragPendingRef = useRef<{ id: string; x: number; y: number } | null>(null);
 
   // Get video source (blob URL or HTTP URL)
   const getVideoSrc = useCallback((src: string | null) => {
@@ -257,6 +266,57 @@ export default function VideoPlayer({
     };
   }, [onResize]);
 
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!draggingTextRef.current || !stageRef.current || !onUpdateTextOverlay) return;
+
+      const drag = draggingTextRef.current;
+      const rect = stageRef.current.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+
+      const dx = e.clientX - drag.startClientX;
+      const dy = e.clientY - drag.startClientY;
+      const nextX = Math.max(0, Math.min(100, drag.initialX + (dx / rect.width) * 100));
+      const nextY = Math.max(0, Math.min(100, drag.initialY + (dy / rect.height) * 100));
+
+      textDragPendingRef.current = {
+        id: drag.id,
+        x: Math.round(nextX * 10) / 10,
+        y: Math.round(nextY * 10) / 10,
+      };
+
+      if (textDragRafRef.current == null) {
+        textDragRafRef.current = window.requestAnimationFrame(() => {
+          textDragRafRef.current = null;
+          const pending = textDragPendingRef.current;
+          textDragPendingRef.current = null;
+          if (!pending) return;
+          onUpdateTextOverlay(pending.id, { x: pending.x, y: pending.y });
+        });
+      }
+    };
+
+    const handleMouseUp = () => {
+      if (!draggingTextRef.current) return;
+      draggingTextRef.current = null;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+
+      if (textDragRafRef.current != null) {
+        window.cancelAnimationFrame(textDragRafRef.current);
+        textDragRafRef.current = null;
+      }
+      textDragPendingRef.current = null;
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [onUpdateTextOverlay]);
+
   // Auto-hide controls
   const resetControlsTimer = useCallback(() => {
     setShowControls(true);
@@ -276,15 +336,15 @@ export default function VideoPlayer({
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-full bg-black flex flex-col"
+      className="relative w-full h-full bg-zinc-950 flex flex-col"
       onMouseMove={resetControlsTimer}
       onMouseEnter={() => setShowControls(true)}
     >
       {/* Video Element */}
-      <div className="flex-1 relative overflow-hidden flex items-center justify-center">
+      <div ref={stageRef} className="flex-1 relative overflow-hidden flex items-center justify-center">
         {isLoading && (
           <div className="absolute inset-0 flex items-center justify-center z-10">
-            <div className="w-10 h-10 border-4 border-primary-500 border-t-transparent rounded-full animate-spin" />
+            <div className="w-10 h-10 border-4 border-white/70 border-t-transparent rounded-full animate-spin" />
           </div>
         )}
 
@@ -324,8 +384,8 @@ export default function VideoPlayer({
         {activeTextOverlays.map(overlay => (
           <div
             key={overlay.id}
-            className={`absolute pointer-events-none transition-opacity duration-300 ${
-              overlay.id === selectedTextId ? 'ring-2 ring-primary-500 ring-offset-2 ring-offset-black/50 pointer-events-auto' : ''
+            className={`absolute transition-opacity duration-150 select-none ${
+              overlay.id === selectedTextId ? 'ring-2 ring-white/75 ring-offset-2 ring-offset-black/50 cursor-move' : 'cursor-pointer'
             }`}
             style={{
               left: `${overlay.x}%`,
@@ -336,6 +396,25 @@ export default function VideoPlayer({
               textShadow: '0 2px 8px rgba(0,0,0,0.8)',
               fontWeight: 600,
             }}
+            onClick={e => {
+              e.stopPropagation();
+              onSelectTextOverlay?.(overlay.id);
+            }}
+            onMouseDown={e => {
+              e.stopPropagation();
+              onSelectTextOverlay?.(overlay.id);
+              if (!onUpdateTextOverlay || !stageRef.current) return;
+
+              draggingTextRef.current = {
+                id: overlay.id,
+                startClientX: e.clientX,
+                startClientY: e.clientY,
+                initialX: overlay.x ?? 50,
+                initialY: overlay.y ?? 50,
+              };
+              document.body.style.cursor = 'move';
+              document.body.style.userSelect = 'none';
+            }}
           >
             {overlay.text}
           </div>
@@ -344,7 +423,7 @@ export default function VideoPlayer({
 
       {/* Controls Bar */}
       <div
-        className={`relative bg-gradient-to-t from-black/90 via-dark-900/80 to-transparent px-4 pb-3 pt-8 transition-opacity duration-300 ${
+        className={`relative bg-gradient-to-t from-zinc-950/90 via-zinc-900/70 to-transparent px-4 pb-3 pt-8 transition-opacity duration-300 ${
           showControls || !isPlaying ? 'opacity-100' : 'opacity-0'
         }`}
       >
@@ -354,7 +433,7 @@ export default function VideoPlayer({
           onClick={handleSeek}
         >
           <div
-            className="h-full bg-primary-500 rounded-full relative transition-all duration-100"
+            className="h-full bg-white/75 rounded-full relative transition-all duration-100"
             style={{ width: `${getProgress()}%` }}
           >
             <div className="absolute right-0 top-1/2 -translate-y-1/2 w-3.5 h-3.5 bg-white rounded-full shadow-lg opacity-0 group-hover:opacity-100 transition-opacity" />
@@ -400,9 +479,6 @@ export default function VideoPlayer({
             <button onClick={onToggleCodeEditor} className={`btn-ghost p-1.5 rounded-lg ${!showCodeEditor ? 'text-white/30' : ''}`} title="Toggle Code Editor">
               <Code className="w-4 h-4" />
             </button>
-            <button onClick={onToggleRightPanel} className={`btn-ghost p-1.5 rounded-lg ${!showRightPanel ? 'text-white/30' : ''}`} title="Toggle Properties">
-              <PanelRight className="w-4 h-4" />
-            </button>
             <button onClick={onToggleFullscreen} className="btn-ghost p-1.5 rounded-lg" title="Toggle Fullscreen">
               {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
             </button>
@@ -413,7 +489,7 @@ export default function VideoPlayer({
       {/* Resize Handle */}
       {!isFullscreen && showCodeEditor && (
         <div
-          className="absolute bottom-0 left-0 right-0 h-1.5 cursor-row-resize bg-transparent hover:bg-primary-500/30 transition-colors z-20"
+          className="absolute bottom-0 left-0 right-0 h-1.5 cursor-row-resize bg-transparent hover:bg-white/20 transition-colors z-20"
           onMouseDown={handleMouseDown}
         />
       )}

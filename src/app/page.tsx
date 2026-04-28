@@ -36,7 +36,7 @@ export default function Home() {
             Start creating beautiful animations today.
         </p>
         <Link
-          href="/editor"
+          href="/app"
           className="px-10 py-5 bg-white text-black font-sans font-medium rounded-full hover:scale-105 hover:bg-gray-100 transition-all duration-300 shadow-[0_0_40px_rgba(255,255,255,0.15)] inline-block"
         >
           Open App

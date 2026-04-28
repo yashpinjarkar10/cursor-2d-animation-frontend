@@ -1,7 +1,6 @@
 'use client';
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { v4 as uuidv4 } from 'uuid';
 import Toast from '@/components/editor/Toast';
 import Toolbar from '@/components/editor/Toolbar';
 import VideoPlayer from '@/components/editor/VideoPlayer';
@@ -10,17 +9,23 @@ import AssetPanel from '@/components/editor/AssetPanel';
 import PropertiesPanel from '@/components/editor/PropertiesPanel';
 import Timeline from '@/components/editor/Timeline';
 import ChatPrompt from '@/components/editor/ChatPrompt';
+import { getBlob } from '@/lib/blobStore';
+import { buildVideoTimelineModel } from '@/lib/editor/videoTimelineModel';
+import { useEditorProjectPersistence } from '@/lib/editor/useEditorProjectPersistence';
+import { useAudioSpeechPlayback } from '@/lib/editor/useAudioSpeechPlayback';
+import { useGenerationController } from '@/lib/editor/useGenerationController';
+import { useClipActions } from '@/lib/editor/useClipActions';
+import { useTextOverlayActions } from '@/lib/editor/useTextOverlayActions';
+import { useTimelineNavigation } from '@/lib/editor/useTimelineNavigation';
 import {
-  generateVideo,
-  getCodeFile,
-  renderManim,
   downloadVideo,
   getOrCreateSessionId,
   type Clip,
   type TextOverlay,
-  type GeneratingTask,
   type ExportSettings,
 } from '@/lib/api';
+
+const COMPACT_BREAKPOINT = 1280;
 
 export default function EditorPage() {
   const [sessionId] = useState(() => getOrCreateSessionId());
@@ -31,34 +36,55 @@ export default function EditorPage() {
   const [textOverlays, setTextOverlays] = useState<TextOverlay[]>([]);
   const [selectedClip, setSelectedClip] = useState<Clip | null>(null);
   const [selectedTextOverlay, setSelectedTextOverlay] = useState<TextOverlay | null>(null);
-  const [isRendering, setIsRendering] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'info' | 'success' | 'error' | 'warning' } | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [seekToTime, setSeekToTime] = useState<number | null>(null);
 
-  const audioPlayersRef = useRef<Map<string, HTMLAudioElement>>(new Map());
-
-  const speechStateRef = useRef<{ clipId: string | null }>(
-    { clipId: null }
-  );
-
-  // Generation tracking
-  const [generatingTasks, setGeneratingTasks] = useState<GeneratingTask[]>([]);
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [generationProgress, setGenerationProgress] = useState(0);
-  const [generationMessage, setGenerationMessage] = useState('');
-  const [generationError, setGenerationError] = useState<string | null>(null);
-
   // Layout state
-  const [playerHeight, setPlayerHeight] = useState(350);
-  const [showCodeEditor, setShowCodeEditor] = useState(true);
+  const [playerHeight, setPlayerHeight] = useState(260);
+  const [showCodeEditor, setShowCodeEditor] = useState(false);
   const [showRightPanel, setShowRightPanel] = useState(true);
+  const [isCompactLayout, setIsCompactLayout] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isCodeEditorFullscreen, setIsCodeEditorFullscreen] = useState(false);
-  const [leftPanelSplit, setLeftPanelSplit] = useState(55); // percentage for ChatPrompt
+  const [leftPanelSplit, setLeftPanelSplit] = useState(45); // percentage for ChatPrompt
   const leftPanelDragging = useRef(false);
   const leftPanelRef = useRef<HTMLDivElement>(null);
+  const wasCompactRef = useRef<boolean | null>(null);
+  const compactHintShownRef = useRef(false);
+
+  const hasShownStorageWarningRef = useRef(false);
+  const { setPlayheadForSave } = useEditorProjectPersistence({
+    clips,
+    audioClips,
+    textOverlays,
+    currentCode,
+    currentVideo,
+    currentTime,
+    selectedClip,
+    selectedTextOverlay,
+    playerHeight,
+    showCodeEditor,
+    showRightPanel,
+    leftPanelSplit,
+    setClips,
+    setAudioClips,
+    setTextOverlays,
+    setCurrentCode,
+    setCurrentVideo,
+    setCurrentTime,
+    setSelectedClip,
+    setSelectedTextOverlay,
+    setPlayerHeight,
+    setShowCodeEditor,
+    setShowRightPanel,
+    setLeftPanelSplit,
+    getBlob,
+  });
+
+  // Memoized video timeline model (fast seek/time updates).
+  const videoTimeline = useMemo(() => buildVideoTimelineModel(clips), [clips]);
 
   // Check if selected clip is trimmed
   const isSelectedClipTrimmed = useMemo(() => {
@@ -80,6 +106,26 @@ export default function EditorPage() {
   const hideToast = useCallback(() => {
     setToast(null);
   }, []);
+
+  const {
+    generatingTasks,
+    isGenerating,
+    generationProgress,
+    generationMessage,
+    generationError,
+    isRendering,
+    handleGenerateVideo,
+    handleCancelGeneration,
+    handleRenderCode,
+  } = useGenerationController({
+    sessionId,
+    showToast,
+    hasShownStorageWarningRef,
+    setClips,
+    setSelectedClip,
+    setCurrentVideo,
+    setCurrentCode,
+  });
 
   const selectedClipId = selectedClip?.id;
 
@@ -111,56 +157,17 @@ export default function EditorPage() {
     audioClipsRef.current = audioClips;
   }, [audioClips]);
 
-  const estimateTtsDurationSeconds = useCallback((text: string, rate?: number): number => {
-    const words = text.trim().split(/\s+/).filter(Boolean).length;
-    // Rough baseline: 170 WPM at rate=1.
-    const wpm = 170 * (typeof rate === 'number' && rate > 0 ? rate : 1);
-    const seconds = words > 0 ? (words / wpm) * 60 : 1;
-    return Math.max(1, Math.min(120, Number.isFinite(seconds) ? seconds : 3));
-  }, []);
-
-  const stopSpeech = useCallback(() => {
-    if (typeof window === 'undefined') return;
-    try {
-      window.speechSynthesis.cancel();
-    } catch {
-      // ignore
-    }
-    speechStateRef.current.clipId = null;
-  }, []);
-
-  const speakClip = useCallback((clip: Clip) => {
-    if (typeof window === 'undefined') return;
-    if (!clip.ttsText) return;
-
-    const id = clip.timelineId || clip.id;
-    stopSpeech();
-
-    const utterance = new SpeechSynthesisUtterance(clip.ttsText);
-    if (typeof clip.ttsRate === 'number') utterance.rate = clip.ttsRate;
-    if (typeof clip.ttsPitch === 'number') utterance.pitch = clip.ttsPitch;
-    if (typeof clip.ttsVolume === 'number') utterance.volume = clip.ttsVolume;
-
-    // Note: voice selection is optional and browser-dependent.
-    if (clip.ttsVoice) {
-      const voices = window.speechSynthesis.getVoices();
-      const match = voices.find(v => v.name === clip.ttsVoice);
-      if (match) utterance.voice = match;
-    }
-
-    utterance.onend = () => {
-      if (speechStateRef.current.clipId === id) {
-        speechStateRef.current.clipId = null;
-      }
-    };
-
-    speechStateRef.current.clipId = id;
-    try {
-      window.speechSynthesis.speak(utterance);
-    } catch {
-      speechStateRef.current.clipId = null;
-    }
-  }, [stopSpeech]);
+  const {
+    speechStateRef,
+    estimateTtsDurationSeconds,
+    stopSpeech,
+  } = useAudioSpeechPlayback({
+    audioClips,
+    setAudioClips,
+    audioClipsRef,
+    currentTime,
+    isPlaying,
+  });
 
   const revokeBlobUrl = useCallback((url?: string) => {
     if (!url || !url.startsWith('blob:')) return;
@@ -171,180 +178,38 @@ export default function EditorPage() {
     }
   }, []);
 
-  const maybeRevokeClipBlobUrls = useCallback((
-    clip: Clip | undefined,
-    remainingClips: Clip[],
-    remainingAudio: Clip[]
-  ) => {
-    if (!clip) return;
+  const {
+    handleAddClip,
+    handleRemoveClip,
+    handleRemoveAudioFromTimeline,
+    handleMoveAudioOnTimeline,
+    handleAddTtsAudio,
+    handleUpdateClip,
+    handleSelectClip,
+    handleRemoveAsset,
+    handleDurationChange,
+    handleTrimClip,
+    handleSplitClip,
+  } = useClipActions({
+    currentTime,
+    clips,
+    audioClips,
+    selectedClip,
+    clipsRef,
+    setClips,
+    setAudioClips,
+    setSelectedClip,
+    setCurrentVideo,
+    setCurrentCode,
+    revokeBlobUrl,
+    hasShownStorageWarningRef,
+    showToast,
+    estimateTtsDurationSeconds,
+    speechStateRef,
+    stopSpeech,
+  });
 
-    const videoUrl = clip.videoUrl;
-    if (videoUrl && videoUrl.startsWith('blob:')) {
-      const stillUsed =
-        remainingClips.some(c => c.videoUrl === videoUrl) ||
-        remainingAudio.some(c => c.videoUrl === videoUrl);
-      if (!stillUsed) revokeBlobUrl(videoUrl);
-    }
-
-    const audioUrl = clip.audioPath;
-    if (audioUrl && audioUrl.startsWith('blob:')) {
-      const stillUsed =
-        remainingClips.some(c => c.audioPath === audioUrl) ||
-        remainingAudio.some(c => c.audioPath === audioUrl);
-      if (!stillUsed) revokeBlobUrl(audioUrl);
-    }
-  }, [revokeBlobUrl]);
-
-  // Keep audio elements in sync with audioClips list (create/remove).
-  useEffect(() => {
-    const players = audioPlayersRef.current;
-    const keep = new Set<string>();
-
-    for (const clip of audioClips) {
-      const id = clip.timelineId || clip.id;
-      if (!clip.audioPath) continue;
-      keep.add(id);
-
-      const existing = players.get(id);
-      if (existing) {
-        if (existing.src !== clip.audioPath) existing.src = clip.audioPath;
-        continue;
-      }
-
-      const audio = new Audio(clip.audioPath);
-      audio.preload = 'auto';
-      players.set(id, audio);
-
-      const onLoaded = () => {
-        const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
-        if (!dur) return;
-        setAudioClips(prev =>
-          prev.map(c => {
-            const cid = c.timelineId || c.id;
-            if (cid !== id) return c;
-            // Only fill in if missing.
-            const nextDuration = c.duration || dur;
-            const nextTrimEnd = c.trimEnd || dur;
-            return { ...c, duration: nextDuration, trimEnd: nextTrimEnd };
-          })
-        );
-      };
-
-      audio.addEventListener('loadedmetadata', onLoaded);
-
-      // Cleanup listener if this audio element ever gets removed.
-      (audio as unknown as { __onLoaded?: () => void }).__onLoaded = onLoaded;
-    }
-
-    for (const [id, audio] of players.entries()) {
-      if (keep.has(id)) continue;
-      try {
-        audio.pause();
-      } catch {
-        // ignore
-      }
-      const onLoaded = (audio as unknown as { __onLoaded?: () => void }).__onLoaded;
-      if (onLoaded) audio.removeEventListener('loadedmetadata', onLoaded);
-      players.delete(id);
-    }
-  }, [audioClips]);
-
-  const syncAudioToTime = useCallback((globalTime: number, playing: boolean) => {
-    const players = audioPlayersRef.current;
-
-    for (const clip of audioClipsRef.current) {
-      const id = clip.timelineId || clip.id;
-      const audio = players.get(id);
-      if (!audio) continue;
-
-      const start = clip.startTime || 0;
-      const clipDur = (clip.trimEnd || clip.duration || 0) - (clip.trimStart || 0);
-      const end = start + Math.max(0, clipDur);
-
-      // If duration unknown, treat as potentially active after start.
-      const isActive = clipDur > 0 ? globalTime >= start && globalTime <= end : globalTime >= start;
-
-      if (!isActive) {
-        try {
-          if (!audio.paused) audio.pause();
-          if (audio.currentTime !== 0) audio.currentTime = 0;
-        } catch {
-          // ignore
-        }
-        continue;
-      }
-
-      const target = Math.max(0, (clip.trimStart || 0) + (globalTime - start));
-
-      // Avoid constant seeking; only correct if drift is meaningful.
-      try {
-        if (Math.abs(audio.currentTime - target) > 0.25) {
-          audio.currentTime = target;
-        }
-        if (playing) {
-          if (audio.paused) {
-            void audio.play().catch(() => {});
-          }
-        } else {
-          if (!audio.paused) audio.pause();
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    // Web Speech API TTS playback (free, browser-only)
-    if (typeof window === 'undefined') return;
-
-    // Keep pause/resume behavior consistent.
-    try {
-      if (!playing) {
-        if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
-          window.speechSynthesis.pause();
-        }
-      } else {
-        if (window.speechSynthesis.paused) window.speechSynthesis.resume();
-      }
-    } catch {
-      // ignore
-    }
-
-    const ttsClips = audioClipsRef.current
-      .filter(c => typeof c.ttsText === 'string' && c.ttsText.trim())
-      .sort((a, b) => (a.startTime || 0) - (b.startTime || 0));
-
-    const active = ttsClips.find(c => {
-      const start = c.startTime || 0;
-      const dur = (c.trimEnd || c.duration || 0) - (c.trimStart || 0);
-      const end = start + Math.max(0, dur);
-      return globalTime >= start && (dur > 0 ? globalTime <= end : true);
-    });
-
-    const activeId = active ? (active.timelineId || active.id) : null;
-
-    // If we left the active clip window, stop speaking.
-    if (!activeId) {
-      if (speechStateRef.current.clipId) stopSpeech();
-      return;
-    }
-
-    // If we are inside a TTS clip and playing, ensure it's started.
-    if (playing) {
-      if (speechStateRef.current.clipId !== activeId) {
-        speakClip(active as Clip);
-      } else {
-        // If synthesis got cancelled externally, restart once.
-        if (!window.speechSynthesis.speaking && !window.speechSynthesis.pending) {
-          speakClip(active as Clip);
-        }
-      }
-    }
-  }, []);
-
-  // Sync audio on seek/time updates and play/pause.
-  useEffect(() => {
-    syncAudioToTime(currentTime, isPlaying);
-  }, [currentTime, isPlaying, syncAudioToTime]);
+  // (Audio + Web Speech sync moved to src/lib/editor/useAudioSpeechPlayback.ts)
 
   useEffect(() => {
     return () => {
@@ -384,420 +249,38 @@ export default function EditorPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isFullscreen, isCodeEditorFullscreen, selectedClip, currentVideo]);
 
-  // AI video generation
-  const handleGenerateVideo = useCallback(async (prompt: string) => {
-    setIsGenerating(true);
-    setGenerationProgress(0);
-    setGenerationMessage('Starting...');
-    setGenerationError(null);
+  // (AI generation + render handlers moved to src/lib/editor/useGenerationController.ts)
 
-    const taskId = uuidv4();
-    setGeneratingTasks(prev => [
-      ...prev,
-      {
-        taskId,
-        prompt,
-        status: 'generating',
-        message: 'Sending to AI...',
-        progress: 0,
-      },
-    ]);
+  const {
+    handleAddText,
+    handleUpdateTextOverlay,
+    handleUpdateText,
+    handleRemoveText,
+    handleSelectText,
+  } = useTextOverlayActions({
+    textOverlays,
+    setTextOverlays,
+    setSelectedTextOverlay,
+    showToast,
+  });
 
-    try {
-      const result = await generateVideo(prompt, sessionId, (progress, message) => {
-        setGenerationProgress(progress);
-        setGenerationMessage(message);
-        setGeneratingTasks(prev =>
-          prev.map(t =>
-            t.taskId === taskId ? { ...t, progress, message, status: 'generating' } : t
-          )
-        );
-      });
-
-      // Remove from generating tasks
-      setGeneratingTasks(prev => prev.filter(t => t.taskId !== taskId));
-
-      if (result.success && result.videoUrl) {
-        let clipCode = '';
-        const codeFilename = result.codeFilename || '';
-
-        // Fetch code if available
-        if (codeFilename) {
-          try {
-            const codeResult = await getCodeFile(codeFilename);
-            if (codeResult.success && codeResult.code) {
-              clipCode = codeResult.code;
-            }
-          } catch {
-            // Code fetch is optional
-          }
-        }
-
-        // Add to clips
-        const newClip: Clip = {
-          id: uuidv4(),
-          type: 'video',
-          source: 'backend',
-          videoUrl: result.videoUrl,
-          code: clipCode || undefined,
-          codeFilename: codeFilename || undefined,
-          name: `Generated: ${prompt.substring(0, 30)}...`,
-          duration: 0,
-          trimStart: 0,
-          trimEnd: 0,
-        };
-
-        setClips(prev => [...prev, newClip]);
-        setSelectedClip(newClip);
-        setCurrentVideo(result.videoUrl);
-        setCurrentCode(clipCode);
-        setGenerationError(null);
-        showToast('Video generated successfully!', 'success');
-      } else {
-        const errorMessage = result.error || 'Unknown error';
-        setGenerationError(errorMessage);
-        showToast(`Failed to generate video: ${errorMessage}`, 'error');
-      }
-    } catch (error: unknown) {
-      setGeneratingTasks(prev => prev.filter(t => t.taskId !== taskId));
-      const errorMessage = (error as Error).message || 'Unknown error';
-      setGenerationError(errorMessage);
-      showToast(`Error: ${errorMessage}`, 'error');
-    } finally {
-      setIsGenerating(false);
-    }
-  }, [sessionId, showToast]);
-
-  // Cancel generation
-  const handleCancelGeneration = useCallback((taskId: string) => {
-    setGeneratingTasks(prev => prev.filter(t => t.taskId !== taskId));
-    showToast('Generation cancelled', 'info');
-  }, [showToast]);
-
-  // Render code
-  const handleRenderCode = useCallback(async (code: string, sceneName: string = 'Scene1') => {
-    setIsRendering(true);
-    const taskId = uuidv4();
-    setGeneratingTasks(prev => [
-      ...prev,
-      {
-        taskId,
-        prompt: `Render: ${sceneName}`,
-        status: 'rendering',
-        message: 'Starting render...',
-        progress: 0,
-        isRender: true,
-      },
-    ]);
-
-    try {
-      const result = await renderManim(code, sceneName, (progress, message) => {
-        setGeneratingTasks(prev =>
-          prev.map(t =>
-            t.taskId === taskId ? { ...t, progress, message } : t
-          )
-        );
-      });
-
-      setGeneratingTasks(prev => prev.filter(t => t.taskId !== taskId));
-
-      if (result.success && result.videoUrl) {
-        const newClip: Clip = {
-          id: uuidv4(),
-          type: 'video',
-          source: 'backend',
-          videoUrl: result.videoUrl,
-          code,
-          name: `Rendered: ${sceneName}`,
-          duration: 0,
-          trimStart: 0,
-          trimEnd: 0,
-        };
-
-        setClips(prev => [...prev, newClip]);
-        setSelectedClip(newClip);
-        setCurrentVideo(result.videoUrl);
-        setCurrentCode(code);
-        showToast(`Rendered scene: ${sceneName}`, 'success');
-      } else {
-        showToast(`Render failed: ${result.error}`, 'error');
-      }
-    } catch (error: unknown) {
-      setGeneratingTasks(prev => prev.filter(t => t.taskId !== taskId));
-      showToast(`Render error: ${(error as Error).message}`, 'error');
-    } finally {
-      setIsRendering(false);
-    }
-  }, [showToast]);
-
-  // Clip management
-  const handleAddClip = useCallback((clip: Partial<Clip>) => {
-    const newClip: Clip = {
-      id: uuidv4(),
-      type: clip.type || 'video',
-      source: clip.source || 'upload',
-      videoUrl: clip.videoUrl,
-      audioPath: clip.audioPath,
-      name: clip.name || 'Untitled',
-      duration: clip.duration || 0,
-      trimStart: clip.trimStart || 0,
-      trimEnd: clip.trimEnd || 0,
-    };
-    setClips(prev => [...prev, newClip]);
-    showToast(`Added: ${newClip.name}`, 'success');
-  }, [showToast]);
-
-  const handleRemoveClip = useCallback((clipId: string) => {
-    const removedClip = clips.find(c => c.id === clipId);
-    const remainingClips = clips.filter(c => c.id !== clipId);
-    setClips(remainingClips);
-
-    const remainingAudio = audioClips.filter(a => a.id !== clipId && a.timelineId !== clipId);
-    if (remainingAudio.length !== audioClips.length) {
-      setAudioClips(remainingAudio);
-    }
-
-    maybeRevokeClipBlobUrls(removedClip, remainingClips, remainingAudio);
-
-    if (selectedClip?.id === clipId) {
-      setSelectedClip(null);
-      setCurrentVideo(null);
-      setCurrentCode('');
-    }
-    if (removedClip) showToast(`Removed: ${removedClip.name}`, 'info');
-  }, [audioClips, clips, maybeRevokeClipBlobUrls, selectedClip, showToast]);
-
-  const handleRemoveAudioFromTimeline = useCallback((audioId: string) => {
-    setAudioClips(prev => {
-      const removed = prev.find(a => (a.timelineId || a.id) === audioId);
-      const remaining = prev.filter(a => (a.timelineId || a.id) !== audioId);
-      maybeRevokeClipBlobUrls(removed, clipsRef.current, remaining);
-      return remaining;
-    });
-    if (speechStateRef.current.clipId === audioId) stopSpeech();
-    showToast('Audio removed from timeline', 'info');
-  }, [maybeRevokeClipBlobUrls, showToast, stopSpeech]);
-
-  const handleMoveAudioOnTimeline = useCallback((audioId: string, startTime: number) => {
-    setAudioClips(prev =>
-      prev.map(a => ((a.timelineId || a.id) === audioId ? { ...a, startTime } : a))
-    );
-    setClips(prev =>
-      prev.map(c =>
-        c.type === 'audio' && (c.timelineId || c.id) === audioId
-          ? { ...c, startTime }
-          : c
-      )
-    );
-  }, []);
-
-  const handleAddTtsAudio = useCallback(async (data: {
-    text: string;
-    voice?: string;
-    rate?: number;
-    pitch?: number;
-    volume?: number;
-  }) => {
-    const startTime = currentTime;
-    const text = data.text;
-    const id = uuidv4();
-    const clipName = `TTS: ${text.substring(0, 32)}${text.length > 32 ? '…' : ''}`;
-    const duration = estimateTtsDurationSeconds(text, data.rate);
-
-    const newAudio: Clip = {
-      id,
-      timelineId: id,
-      type: 'audio',
-      source: 'local',
-      ttsText: text,
-      ttsVoice: data.voice,
-      ttsRate: data.rate,
-      ttsPitch: data.pitch,
-      ttsVolume: data.volume,
-      name: clipName,
-      duration,
-      trimStart: 0,
-      trimEnd: duration,
-      startTime,
-    };
-
-    setClips(prev => [...prev, newAudio]);
-    setAudioClips(prev => [...prev, newAudio]);
-    setSelectedClip(newAudio);
-    showToast('Speech added to timeline', 'success');
-  }, [currentTime, estimateTtsDurationSeconds, showToast]);
-
-  const handleUpdateClip = useCallback((clip: Clip) => {
-    setClips(prev => prev.map(c => (c.id === clip.id ? clip : c)));
-    if (clip.type === 'audio') {
-      setAudioClips(prev => prev.map(a => ((a.timelineId || a.id) === clip.id ? { ...a, ...clip } : a)));
-    }
-  }, []);
-
-  const handleSelectClip = useCallback((clip: Clip | null) => {
-    if (clip) {
-      setSelectedClip(clip);
-      if (clip.type === 'video') {
-        setCurrentVideo(clip.videoUrl || clip.videoPath || null);
-      }
-      setCurrentCode(clip.code || '');
-    } else {
-      setSelectedClip(null);
-      setCurrentCode('');
-    }
-  }, []);
-
-  const handleRemoveAsset = useCallback((assetId: string, assetType: string) => {
-    const removedClip = clips.find(c => c.id === assetId);
-    const remainingClips = clips.filter(c => c.id !== assetId);
-    setClips(remainingClips);
-
-    const remainingAudio =
-      assetType === 'audio'
-        ? audioClips.filter(a => a.id !== assetId && a.timelineId !== assetId)
-        : audioClips;
-
-    if (assetType === 'audio') setAudioClips(remainingAudio);
-
-    maybeRevokeClipBlobUrls(removedClip, remainingClips, remainingAudio);
-
-    if (selectedClip?.id === assetId) {
-      setSelectedClip(null);
-      if (assetType === 'video') setCurrentVideo(null);
-      setCurrentCode('');
-    }
-    if (removedClip) showToast(`Removed: ${removedClip.name}`, 'info');
-  }, [audioClips, clips, maybeRevokeClipBlobUrls, selectedClip, showToast]);
-
-  // Duration change from player
-  const handleDurationChange = useCallback((clipId: string, duration: number) => {
-    setClips(prev =>
-      prev.map(c => {
-        if (c.id === clipId) {
-          const newClip = { ...c, duration };
-          if (!c.trimEnd || c.trimEnd === 0) newClip.trimEnd = duration;
-          if (c.trimStart === undefined) newClip.trimStart = 0;
-          return newClip;
-        }
-        return c;
-      })
-    );
-  }, []);
-
-  // Trim/split
-  const handleTrimClip = useCallback((clipId: string, trimStart: number, trimEnd: number) => {
-    setClips(prev => prev.map(c => (c.id === clipId ? { ...c, trimStart, trimEnd } : c)));
-  }, []);
-
-  const handleSplitClip = useCallback((clipId: string, splitTime: number) => {
-    setClips(prev => {
-      const clipIndex = prev.findIndex(c => c.id === clipId);
-      if (clipIndex === -1) return prev;
-      const clip = prev[clipIndex];
-      const firstPart: Clip = {
-        ...clip,
-        id: uuidv4(),
-        name: clip.name.replace(/ \(part \d+\)$/, '') + ' (part 1)',
-        trimEnd: splitTime,
-      };
-      const secondPart: Clip = {
-        ...clip,
-        id: uuidv4(),
-        name: clip.name.replace(/ \(part \d+\)$/, '') + ' (part 2)',
-        trimStart: splitTime,
-      };
-      const newClips = [...prev];
-      newClips.splice(clipIndex, 1, firstPart, secondPart);
-      return newClips;
-    });
-    showToast('Clip split into two parts', 'success');
-  }, [showToast]);
-
-  // Text overlays
-  const handleAddText = useCallback((textData: Partial<TextOverlay>) => {
-    const newText: TextOverlay = {
-      id: uuidv4(),
-      text: textData.text || 'Text',
-      startTime: textData.startTime || 0,
-      duration: textData.duration || 3,
-      x: textData.x ?? 50,
-      y: textData.y ?? 50,
-      fontSize: textData.fontSize || 32,
-      color: textData.color || '#ffffff',
-    };
-    setTextOverlays(prev => [...prev, newText]);
-    showToast(`Added text: "${newText.text.substring(0, 20)}"`, 'success');
-  }, [showToast]);
-
-  const handleUpdateTextOverlay = useCallback((textId: string, updates: Partial<TextOverlay>) => {
-    setTextOverlays(prev => prev.map(t => (t.id === textId ? { ...t, ...updates } : t)));
-    setSelectedTextOverlay(prev => (prev?.id === textId ? { ...prev, ...updates } : prev));
-  }, []);
-
-  const handleRemoveText = useCallback((textId: string) => {
-    setTextOverlays(prev => prev.filter(t => t.id !== textId));
-    if (selectedTextOverlay?.id === textId) setSelectedTextOverlay(null);
-    showToast('Text overlay removed', 'info');
-  }, [selectedTextOverlay, showToast]);
-
-  const handleSelectText = useCallback((textId: string) => {
-    const text = textOverlays.find(t => t.id === textId);
-    setSelectedTextOverlay(text || null);
-  }, [textOverlays]);
-
-  // Timeline
-  const handleSeek = useCallback((globalTime: number) => {
-    setCurrentTime(globalTime);
-    const videoClips = clips.filter(c => c.type === 'video');
-    let accumulatedTime = 0;
-    for (const clip of videoClips) {
-      const clipDuration = (clip.trimEnd || clip.duration || 0) - (clip.trimStart || 0);
-      if (globalTime < accumulatedTime + clipDuration) {
-        const localTime = (clip.trimStart || 0) + (globalTime - accumulatedTime);
-        if (selectedClip?.id !== clip.id) {
-          setSelectedClip(clip);
-          setCurrentVideo(clip.videoUrl || clip.videoPath || null);
-          setCurrentCode(clip.code || '');
-        }
-        setSeekToTime(localTime);
-        return;
-      }
-      accumulatedTime += clipDuration;
-    }
-  }, [clips, selectedClip]);
-
-  const getClipTimelineStart = useCallback((clipId: string): number => {
-    const videoClips = clips.filter(c => c.type === 'video');
-    let accumulatedTime = 0;
-    for (const clip of videoClips) {
-      if (clip.id === clipId) return accumulatedTime;
-      accumulatedTime += (clip.trimEnd || clip.duration || 0) - (clip.trimStart || 0);
-    }
-    return 0;
-  }, [clips]);
-
-  const handleTimeUpdate = useCallback((localTime: number, clipId?: string) => {
-    if (!clipId) {
-      setCurrentTime(localTime);
-      return;
-    }
-    const timelineStart = getClipTimelineStart(clipId);
-    const clip = clips.find(c => c.id === clipId);
-    if (clip) {
-      const relativeTime = localTime - (clip.trimStart || 0);
-      setCurrentTime(timelineStart + relativeTime);
-    }
-  }, [getClipTimelineStart, clips]);
-
-  const handlePlayStateChange = useCallback((playing: boolean) => {
-    setIsPlaying(playing);
-  }, []);
-
-  const handleClipEnded = useCallback((nextClip: Clip) => {
-    setSelectedClip(nextClip);
-    setCurrentVideo(nextClip.videoUrl || nextClip.videoPath || null);
-    setCurrentCode(nextClip.code || '');
-  }, []);
+  const {
+    handleSeek,
+    handleTimeUpdate,
+    handlePlayStateChange,
+    handleClipEnded,
+  } = useTimelineNavigation({
+    videoTimeline,
+    selectedClip,
+    currentTime,
+    setCurrentTime,
+    setPlayheadForSave,
+    setSelectedClip,
+    setCurrentVideo,
+    setCurrentCode,
+    setSeekToTime,
+    setIsPlaying,
+  });
 
   // Export
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -810,17 +293,67 @@ export default function EditorPage() {
     showToast('Video download started!', 'success');
   }, [currentVideo, showToast]);
 
-  // Player resize
+  // Code drawer resize (drag handle lives at the bottom edge of the video area)
   const handlePlayerResize = useCallback((deltaY: number) => {
     setPlayerHeight(prev => {
-      const maxH = window.innerHeight - 350;
-      return Math.max(150, Math.min(maxH, prev + deltaY));
+      const minH = 170;
+      const maxH = Math.min(460, Math.floor(window.innerHeight * 0.55));
+      return Math.max(minH, Math.min(maxH, prev - deltaY));
     });
   }, []);
 
   const toggleFullscreen = useCallback(() => setIsFullscreen(prev => !prev), []);
   const toggleCodeEditor = useCallback(() => setShowCodeEditor(prev => !prev), []);
-  const toggleRightPanel = useCallback(() => setShowRightPanel(prev => !prev), []);
+
+  // Responsive hierarchy: under 1280, keep preview + timeline dominant.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const applyResponsiveHierarchy = () => {
+      const compact = window.innerWidth < COMPACT_BREAKPOINT;
+      setIsCompactLayout(compact);
+
+      const prevCompact = wasCompactRef.current;
+      wasCompactRef.current = compact;
+
+      if (prevCompact === compact) return;
+      if (compact) {
+        setShowRightPanel(false);
+        setShowCodeEditor(false);
+        setLeftPanelSplit(prev => Math.max(35, Math.min(60, prev)));
+        setPlayerHeight(prev => Math.max(170, Math.min(320, prev)));
+
+        if (!compactHintShownRef.current) {
+          showToast('Compact layout enabled: focus on Preview + Timeline.', 'info');
+          compactHintShownRef.current = true;
+        }
+        return;
+      }
+
+      // Keep properties visible by default on desktop layout.
+      setShowRightPanel(true);
+    };
+
+    applyResponsiveHierarchy();
+    window.addEventListener('resize', applyResponsiveHierarchy, { passive: true });
+    return () => window.removeEventListener('resize', applyResponsiveHierarchy);
+  }, [showToast]);
+
+  useEffect(() => {
+    const handlePanelShortcuts = (e: KeyboardEvent) => {
+      const activeTag = (document.activeElement?.tagName || '').toUpperCase();
+      if (activeTag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'SELECT') return;
+
+      if ((e.ctrlKey || e.metaKey) && e.key === '\\') {
+        e.preventDefault();
+        toggleCodeEditor();
+        return;
+      }
+    };
+
+    window.addEventListener('keydown', handlePanelShortcuts);
+    return () => window.removeEventListener('keydown', handlePanelShortcuts);
+  }, [toggleCodeEditor]);
 
   // Left panel split resize
   const handleLeftPanelDragStart = useCallback((e: React.MouseEvent) => {
@@ -835,7 +368,7 @@ export default function EditorPage() {
       if (!leftPanelDragging.current || !leftPanelRef.current) return;
       const rect = leftPanelRef.current.getBoundingClientRect();
       const pct = ((e.clientY - rect.top) / rect.height) * 100;
-      setLeftPanelSplit(Math.max(20, Math.min(80, pct)));
+      setLeftPanelSplit(Math.max(35, Math.min(70, pct)));
     };
     const handleMouseUp = () => {
       leftPanelDragging.current = false;
@@ -851,13 +384,13 @@ export default function EditorPage() {
   }, []);
 
   return (
-    <div className="flex flex-col h-screen bg-dark-900 text-white">
+    <div className="flex flex-col h-screen text-white studio-shell-bg">
       {/* Toast */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={hideToast} />}
 
       {/* Fullscreen Video Overlay */}
       {isFullscreen && (
-        <div className="fixed inset-0 bg-black z-50 flex flex-col">
+        <div className="fixed inset-0 bg-zinc-950 z-50 flex flex-col">
           <VideoPlayer
             videoUrl={currentVideo}
             selectedClip={selectedClip}
@@ -877,17 +410,16 @@ export default function EditorPage() {
             isFullscreen={true}
             showCodeEditor={false}
             onToggleCodeEditor={() => {}}
-            showRightPanel={false}
-            onToggleRightPanel={() => {}}
             onUpdateTextOverlay={handleUpdateTextOverlay}
             selectedTextId={selectedTextOverlay?.id}
+            onSelectTextOverlay={handleSelectText}
           />
         </div>
       )}
 
       {/* Code Editor Fullscreen */}
       {isCodeEditorFullscreen && (
-        <div className="fixed inset-0 bg-dark-900 z-50 flex flex-col">
+        <div className="fixed inset-0 bg-zinc-900/95 z-50 flex flex-col">
           <CodeEditor
             code={displayCode}
             onChange={isSelectedClipTrimmed ? undefined : handleCodeChange}
@@ -902,12 +434,15 @@ export default function EditorPage() {
       )}
 
       {/* Toolbar */}
-      <Toolbar onExport={handleExport} isRendering={isRendering} />
+      <Toolbar
+        onExport={handleExport}
+        isRendering={isRendering}
+      />
 
       {/* Main Content */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
         {/* Left Panel - AI Chat + Assets */}
-        <div ref={leftPanelRef} className="w-64 flex flex-col border-r border-dark-700 shrink-0">
+        <div ref={leftPanelRef} className="w-56 lg:w-[15.5rem] xl:w-64 flex flex-col border-r border-white/10 bg-zinc-900/70 shrink-0">
           {/* Chat Prompt */}
           <div className="overflow-hidden" style={{ height: `${leftPanelSplit}%`, minHeight: '120px' }}>
             <ChatPrompt
@@ -920,13 +455,13 @@ export default function EditorPage() {
           </div>
           {/* Resize Handle */}
           <div
-            className="h-1.5 cursor-row-resize bg-dark-700 hover:bg-primary-500/40 transition-colors shrink-0 flex items-center justify-center"
+            className="h-1.5 cursor-row-resize bg-white/5 hover:bg-white/20 transition-colors shrink-0 flex items-center justify-center"
             onMouseDown={handleLeftPanelDragStart}
           >
             <div className="w-8 h-0.5 bg-white/10 rounded-full" />
           </div>
           {/* Assets */}
-          <div className="flex-1 min-h-[120px] overflow-hidden border-t border-dark-700">
+          <div className="flex-1 min-h-[120px] overflow-hidden border-t border-white/10 bg-zinc-900/60">
             <AssetPanel
               clips={clips}
               selectedClip={selectedClip}
@@ -943,8 +478,7 @@ export default function EditorPage() {
         <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
           {/* Video Player */}
           <div
-            className={`relative z-10 overflow-hidden ${showCodeEditor ? 'flex-shrink-0' : 'flex-1'}`}
-            style={showCodeEditor ? { height: `${playerHeight}px`, minHeight: '150px' } : { minHeight: '150px' }}
+            className="relative z-10 overflow-hidden flex-1 min-h-[220px]"
           >
             <VideoPlayer
               videoUrl={currentVideo}
@@ -965,16 +499,18 @@ export default function EditorPage() {
               isFullscreen={isFullscreen}
               showCodeEditor={showCodeEditor}
               onToggleCodeEditor={toggleCodeEditor}
-              showRightPanel={showRightPanel}
-              onToggleRightPanel={toggleRightPanel}
               onUpdateTextOverlay={handleUpdateTextOverlay}
               selectedTextId={selectedTextOverlay?.id}
+              onSelectTextOverlay={handleSelectText}
             />
           </div>
 
           {/* Code Editor */}
           {showCodeEditor && (
-            <div className="flex-1 min-h-[200px] overflow-hidden border-t border-dark-700">
+            <div
+              className="shrink-0 min-h-[170px] overflow-hidden border-t border-white/10 bg-zinc-900/60"
+              style={{ height: `${Math.max(170, Math.min(460, playerHeight))}px`, maxHeight: '55%' }}
+            >
               <CodeEditor
                 code={displayCode}
                 onChange={isSelectedClipTrimmed ? undefined : handleCodeChange}
@@ -990,7 +526,7 @@ export default function EditorPage() {
         </div>
 
         {/* Right Panel - Properties */}
-        {showRightPanel && (
+        {showRightPanel && !isCompactLayout && (
           <PropertiesPanel
             selectedClip={selectedClip}
             onUpdateClip={handleUpdateClip}
@@ -998,7 +534,7 @@ export default function EditorPage() {
             onAddTtsAudio={handleAddTtsAudio}
             currentTime={currentTime}
             selectedTextOverlay={selectedTextOverlay}
-            onUpdateText={(text: TextOverlay) => setTextOverlays(prev => prev.map(t => (t.id === text.id ? text : t)))}
+            onUpdateText={handleUpdateText}
             onSelectText={handleSelectText}
             onRemoveText={handleRemoveText}
             textOverlays={textOverlays}
@@ -1021,6 +557,7 @@ export default function EditorPage() {
         onMoveAudio={handleMoveAudioOnTimeline}
         onRemoveText={handleRemoveText}
         onSelectText={handleSelectText}
+        onUpdateTextOverlay={handleUpdateTextOverlay}
         currentTime={currentTime}
         onSeek={handleSeek}
       />

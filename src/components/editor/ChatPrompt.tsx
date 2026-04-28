@@ -151,15 +151,15 @@ export default function ChatPrompt({
     };
 
     return (
-        <div className="flex flex-col h-full bg-dark-800 border-r border-dark-700">
+        <div className="flex flex-col h-full bg-zinc-900/70 border-r border-white/10 backdrop-blur-sm">
             {/* Header */}
             <div
-                className="flex items-center justify-between px-4 py-3 border-b border-dark-700 cursor-pointer hover:bg-dark-700/30 transition-colors"
+                className="flex items-center justify-between px-4 py-3 border-b border-white/10 cursor-pointer hover:bg-white/5 studio-interactive"
                 onClick={() => setIsExpanded(!isExpanded)}
             >
                 <div className="flex items-center gap-2">
-                    <Sparkles className="w-4 h-4 text-primary-400" />
-                    <h3 className="text-sm font-semibold text-white">AI Prompt</h3>
+                    <Sparkles className="w-4 h-4 text-white/70" />
+                    <h3 className="studio-heading">AI Prompt</h3>
                 </div>
                 {isExpanded ? (
                     <ChevronUp className="w-4 h-4 text-white/40" />
@@ -171,7 +171,7 @@ export default function ChatPrompt({
             {isExpanded && (
                 <>
                     {/* Messages */}
-                    <div className="flex-1 overflow-y-auto px-3 py-3 space-y-3 min-h-0">
+                    <div className="flex-1 overflow-y-auto px-3 py-3 space-y-2.5 min-h-0">
                         {messages.length === 0 && (
                             <div className="text-center py-6">
                                 <Wand2 className="w-8 h-8 text-white/15 mx-auto mb-3" />
@@ -183,7 +183,7 @@ export default function ChatPrompt({
                                         <button
                                             key={chip}
                                             onClick={() => handleSuggestionClick(chip)}
-                                            className="text-[10px] px-2.5 py-1 rounded-full bg-dark-700 text-white/50 hover:text-white/80 hover:bg-dark-600 transition-all"
+                                            className="text-[10px] px-2.5 py-1 rounded-full bg-white/[0.05] border border-white/10 text-white/55 hover:text-white hover:bg-white/[0.1] studio-interactive"
                                         >
                                             {chip}
                                         </button>
@@ -199,20 +199,20 @@ export default function ChatPrompt({
                             >
                                 <div
                                     className={`max-w-[85%] rounded-xl px-3 py-2 text-xs ${msg.role === 'user'
-                                            ? 'bg-primary-600/80 text-white'
-                                            : 'bg-dark-700 text-white/80'
-                                        }`}
+                                            ? 'bg-white text-black border border-white/80'
+                                            : 'bg-white/[0.04] border border-white/10 text-white/80'
+                                        } studio-interactive`}
                                 >
                                     <p>{msg.content}</p>
                                     {msg.role === 'assistant' && msg.status === 'generating' && (
                                         <div className="mt-2">
                                             <div className="flex items-center gap-2 mb-1">
-                                                <Loader2 className="w-3 h-3 animate-spin text-primary-400" />
+                                                <Loader2 className="w-3 h-3 animate-spin text-white/70" />
                                                 <span className="text-[10px] text-white/50">{msg.progressMessage}</span>
                                             </div>
-                                            <div className="w-full h-1 bg-dark-600 rounded-full overflow-hidden">
+                                            <div className="w-full h-1 bg-white/10 rounded-full overflow-hidden">
                                                 <div
-                                                    className="h-full bg-primary-500 rounded-full transition-all duration-300"
+                                                    className="h-full bg-white/75 rounded-full transition-all duration-300"
                                                     style={{ width: `${msg.progress || 0}%` }}
                                                 />
                                             </div>
@@ -225,7 +225,7 @@ export default function ChatPrompt({
                     </div>
 
                     {/* Input */}
-                    <div className="p-3 border-t border-dark-700">
+                    <div className="p-3 border-t border-white/10 bg-zinc-900/60">
                         <div className="flex gap-2 items-end">
                             <textarea
                                 ref={inputRef}
@@ -240,7 +240,7 @@ export default function ChatPrompt({
                             <button
                                 onClick={handleSubmit}
                                 disabled={!prompt.trim() || isGenerating}
-                                className="btn btn-primary !p-2.5 rounded-xl shrink-0"
+                                className="btn studio-btn-solid studio-interactive !p-2.5 rounded-xl shrink-0"
                                 title="Generate (Enter)"
                             >
                                 {isGenerating ? (

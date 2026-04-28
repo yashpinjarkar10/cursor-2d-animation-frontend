@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { Film, Download, Settings, ArrowLeft, Keyboard } from 'lucide-react';
+import { Film, Download, Settings, ArrowLeft } from 'lucide-react';
 import Link from 'next/link';
 import type { ExportSettings } from '@/lib/api';
 
@@ -40,38 +40,32 @@ export default function Toolbar({ onExport, isRendering }: ToolbarProps) {
 
     return (
         <>
-            <div className="h-14 bg-dark-800 border-b border-dark-700 flex items-center px-4 gap-4 shrink-0">
+            <div className="h-[58px] studio-toolbar flex items-center px-5 gap-4 shrink-0">
                 {/* Back to Landing */}
                 <Link
                     href="/"
-                    className="btn-ghost p-2 rounded-lg hover:bg-dark-700 transition-colors"
+                    className="studio-btn-quiet studio-interactive p-2 rounded-lg"
                     title="Back to Home"
                 >
                     <ArrowLeft className="w-4 h-4" />
                 </Link>
 
-                <div className="w-px h-6 bg-dark-600" />
+                <div className="w-px h-6 bg-white/10" />
 
                 {/* Logo */}
                 <div className="flex items-center gap-2">
-                    <Film className="w-5 h-5 text-primary-500" />
-                    <h1 className="text-base font-bold tracking-tight">
+                    <Film className="w-5 h-5 text-white/75" />
+                    <h1 className="text-[17px] font-semibold tracking-tight">
                         <span className="text-white">Manim</span>
-                        <span className="text-primary-400 ml-1">Studio</span>
+                        <span className="text-white/55 ml-1">Studio</span>
                     </h1>
                 </div>
 
                 <div className="flex-1" />
 
-                {/* Keyboard Shortcuts Hint */}
-                <div className="hidden md:flex items-center gap-1.5 text-[10px] text-white/25">
-                    <Keyboard className="w-3 h-3" />
-                    <span>Ctrl+E Export</span>
-                </div>
-
                 {/* Export Button */}
                 <button
-                    className="btn btn-secondary flex items-center gap-2"
+                    className="btn studio-btn-solid studio-interactive flex items-center gap-2"
                     onClick={() => setShowExportModal(true)}
                     disabled={isRendering}
                     title="Export (Ctrl+E)"
@@ -84,15 +78,15 @@ export default function Toolbar({ onExport, isRendering }: ToolbarProps) {
             {/* Export Modal */}
             {showExportModal && (
                 <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 animate-fade-in">
-                    <div className="panel-glass p-6 w-[460px] shadow-2xl animate-slide-up">
-                        <h2 className="text-lg font-bold mb-5 flex items-center gap-2">
-                            <Settings className="w-5 h-5 text-primary-400" />
+                    <div className="studio-modal p-6 w-[460px] shadow-2xl animate-slide-up">
+                        <h2 className="text-lg font-semibold mb-5 flex items-center gap-2">
+                            <Settings className="w-5 h-5 text-white/70" />
                             Export Settings
                         </h2>
 
                         <div className="space-y-4">
                             <div>
-                                <label className="block text-xs font-medium mb-1.5 text-white/60 uppercase tracking-wider">Quality</label>
+                                <label className="block text-xs font-medium mb-1.5 text-white/55 uppercase tracking-wider">Quality</label>
                                 <select
                                     className="input"
                                     value={exportSettings.quality}
@@ -105,7 +99,7 @@ export default function Toolbar({ onExport, isRendering }: ToolbarProps) {
                             </div>
 
                             <div>
-                                <label className="block text-xs font-medium mb-1.5 text-white/60 uppercase tracking-wider">Aspect Ratio</label>
+                                <label className="block text-xs font-medium mb-1.5 text-white/55 uppercase tracking-wider">Aspect Ratio</label>
                                 <select
                                     className="input"
                                     value={exportSettings.aspectRatio}
@@ -119,7 +113,7 @@ export default function Toolbar({ onExport, isRendering }: ToolbarProps) {
                             </div>
 
                             <div>
-                                <label className="block text-xs font-medium mb-1.5 text-white/60 uppercase tracking-wider">Resolution</label>
+                                <label className="block text-xs font-medium mb-1.5 text-white/55 uppercase tracking-wider">Resolution</label>
                                 <select
                                     className="input"
                                     value={exportSettings.resolution}
@@ -133,16 +127,16 @@ export default function Toolbar({ onExport, isRendering }: ToolbarProps) {
                             </div>
                         </div>
 
-                        <p className="text-[10px] text-white/30 mt-4">
+                        <p className="text-[10px] text-white/40 mt-4">
                             ⓘ Web export downloads the video file. For advanced FFmpeg export, use the desktop app.
                         </p>
 
                         <div className="flex gap-2 mt-5">
-                            <button className="btn btn-primary flex-1" onClick={handleExport}>
+                            <button className="btn studio-btn-solid studio-interactive flex-1" onClick={handleExport}>
                                 <Download className="w-4 h-4" />
                                 Download Video
                             </button>
-                            <button className="btn btn-secondary" onClick={() => setShowExportModal(false)}>
+                            <button className="btn studio-btn-quiet studio-interactive" onClick={() => setShowExportModal(false)}>
                                 Cancel
                             </button>
                         </div>
